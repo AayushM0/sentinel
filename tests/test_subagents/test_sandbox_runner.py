@@ -278,6 +278,106 @@ async def test_sandbox_runner_linter_errors_non_fatal(basic_request):
     assert "E501" in result.linter_errors[0]
 
 
+@pytest.mark.asyncio
+async def test_sandbox_runner_deep_nested_and_multiple_files(tmp_path):
+    """Deep nested files (e.g. src/a/b/c/foo.py) are uploaded with POSIX paths and directories."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='nested'\n")
+    nested_file = tmp_path / "src" / "a" / "b" / "c" / "deep.py"
+    nested_file.parent.mkdir(parents=True)
+    nested_file.write_text("def deep(): return 42\n")
+
+    req = SandboxRequest(
+        session_id="sess_nested",
+        project_root=str(tmp_path),
+        changed_files=[str(nested_file)],
+        test_command="pytest",
+        timeout_seconds=30,
+    )
+
+    sandbox = _make_mock_sandbox(
+        [
+            _make_exec_response(0, ""),
+            _make_exec_response(0, "1 passed in 0.1s"),
+        ]
+    )
+    client = _make_mock_client(sandbox)
+
+    with patch("sentinel.subagents.sandbox_runner.AsyncDaytona") as MockDaytona:
+        MockDaytona.return_value.__aenter__ = AsyncMock(return_value=client)
+        MockDaytona.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        result = await SandboxRunner().run(req)
+
+    assert result.sandbox_status == "completed"
+    assert result.tests_passed == 1
+    # Verify upload was called with forward slashes in destination
+    uploaded_dests = [call.args[1] for call in sandbox.fs.upload_file.call_args_list]
+    assert any("/workspace/src/a/b/c/deep.py" in d for d in uploaded_dests)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_end_to_end_approval_gate_integration(tmp_path, monkeypatch):
+    """End-to-end test verifying SandboxRunner output seamlessly feeds into ApprovalGate."""
+    from sentinel.approval_gate import ApprovalDecision, ApprovalGate
+    from sentinel.session_store import SessionStore
+
+    db_path = tmp_path / "e2e.db"
+    store = SessionStore(db_path=str(db_path))
+    session = store.create_session(branch_name="feat/e2e", commit_sha="e2e123")
+
+    req = SandboxRequest(
+        session_id=session.session_id,
+        project_root=str(tmp_path),
+        changed_files=[],
+        test_command="pytest",
+        timeout_seconds=30,
+    )
+
+    sandbox = _make_mock_sandbox(
+        [
+            _make_exec_response(0, ""),
+            _make_exec_response(0, "10 passed in 1.0s"),
+        ]
+    )
+    client = _make_mock_client(sandbox)
+
+    with patch("sentinel.subagents.sandbox_runner.AsyncDaytona") as MockDaytona:
+        MockDaytona.return_value.__aenter__ = AsyncMock(return_value=client)
+        MockDaytona.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        runner_result = await SandboxRunner(session_store=store).run(req)
+
+    assert runner_result.sandbox_status == "completed"
+    assert runner_result.exit_code == 0
+
+    # Feed result into ApprovalGate
+    gate = ApprovalGate(session_store=store)
+    card = gate.format_approval_card(
+        session_id=session.session_id,
+        branch_name="feat/e2e",
+        commit_sha="e2e123",
+        test_result=runner_result.to_dict(),
+        delta_report={},
+    )
+    assert "**Status:** `SUCCESS`" in card
+    assert "10/10" in card
+
+    # User approves
+    monkeypatch.setattr("builtins.input", lambda _: "approve")
+    decision = gate.request_approval(
+        session=session,
+        test_result=runner_result.to_dict(),
+        delta_report={},
+        interactive=True,
+    )
+    assert decision == ApprovalDecision.APPROVED
+
+    # Confirm session status is now APPROVED
+    updated_session = store.get_session(session.session_id)
+    assert updated_session is not None
+    assert updated_session.status.value == "APPROVED"
+
+
 # ---------------------------------------------------------------------------
 # _parse_pytest_output unit tests (pure, no mocks needed)
 # ---------------------------------------------------------------------------
