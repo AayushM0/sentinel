@@ -37,9 +37,7 @@ class ApprovalGate:
         modified_adrs = delta_report.get("modified_adrs", [])
 
         is_success = (
-            sandbox_status in ("completed", "success")
-            and exit_code == 0
-            and tests_failed == 0
+            sandbox_status in ("completed", "success") and exit_code == 0 and tests_failed == 0
         )
         status_str = "SUCCESS" if is_success else "FAILURE"
         pass_str = (
@@ -164,14 +162,23 @@ if __name__ == "__main__":
     # Framework-free self-check (Rule 2903681)
     gate = ApprovalGate()
     # 1. Test success card
-    success_res = {"exit_code": 0, "sandbox_status": "completed", "tests_passed": 5, "tests_failed": 0}
+    success_res = {
+        "exit_code": 0,
+        "sandbox_status": "completed",
+        "tests_passed": 5,
+        "tests_failed": 0,
+    }
     card_ok = gate.format_approval_card("s1", "main", "abc1234", success_res, {})
     assert "**Status:** `SUCCESS`" in card_ok, "Expected SUCCESS status on clean exit"
 
     # 2. Test crashed runner (exit_code 1, tests_failed 0)
-    crashed_res = {"exit_code": 1, "sandbox_status": "crashed", "tests_passed": 0, "tests_failed": 0}
+    crashed_res = {
+        "exit_code": 1,
+        "sandbox_status": "crashed",
+        "tests_passed": 0,
+        "tests_failed": 0,
+    }
     card_fail = gate.format_approval_card("s1", "main", "abc1234", crashed_res, {})
     assert "**Status:** `FAILURE`" in card_fail, "Expected FAILURE status on crashed sandbox run"
 
     print("ApprovalGate standalone self-check passed successfully.")
-

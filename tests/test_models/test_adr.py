@@ -80,4 +80,3 @@ if __name__ == "__main__":
     test_madr_minimal_defaults()
     test_madr_proposed_and_rejected_statuses()
     print("test_adr.py standalone checks passed.")
-

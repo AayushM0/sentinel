@@ -36,4 +36,3 @@ class LaceContextResponse(BaseModel):
     cwd: str = ""
     instructions: str = ""
     message: str = ""
-

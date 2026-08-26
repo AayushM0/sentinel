@@ -220,9 +220,7 @@ class LaceMcpClient:
             },
         )
         if getattr(result, "is_error", False) is True:
-            raise RuntimeError(
-                f"LACE search_memory tool failed: {getattr(result, 'content', '')}"
-            )
+            raise RuntimeError(f"LACE search_memory tool failed: {getattr(result, 'content', '')}")
 
         if not result.content:
             return []
@@ -257,9 +255,7 @@ class LaceMcpClient:
 
         result = await session.call_tool("set_context", args)
         if getattr(result, "is_error", False) is True:
-            raise RuntimeError(
-                f"LACE set_context tool failed: {getattr(result, 'content', '')}"
-            )
+            raise RuntimeError(f"LACE set_context tool failed: {getattr(result, 'content', '')}")
 
         if not result.content:
             return LaceContextResponse()
@@ -284,7 +280,9 @@ if __name__ == "__main__":
         # 1. Test schema validation on search_memory
         mock_search_res = MagicMock()
         mock_search_res.is_error = False
-        mock_search_res.content = [MagicMock(text=json.dumps([{"id": "mem_1", "title": "SelfCheck", "content": "Ok"}]))]
+        mock_search_res.content = [
+            MagicMock(text=json.dumps([{"id": "mem_1", "title": "SelfCheck", "content": "Ok"}]))
+        ]
         mock_sess.call_tool = AsyncMock(return_value=mock_search_res)
         client._session = mock_sess
         client._is_connected = True
@@ -297,7 +295,9 @@ if __name__ == "__main__":
         # 2. Test schema validation on set_context
         mock_ctx_res = MagicMock()
         mock_ctx_res.is_error = False
-        mock_ctx_res.content = [MagicMock(text=json.dumps({"status": "active", "project": "sentinel"}))]
+        mock_ctx_res.content = [
+            MagicMock(text=json.dumps({"status": "active", "project": "sentinel"}))
+        ]
         mock_sess.call_tool = AsyncMock(return_value=mock_ctx_res)
         ctx = await client.set_context("D:/sentinel")
         assert isinstance(ctx, LaceContextResponse)
@@ -306,4 +306,3 @@ if __name__ == "__main__":
         print("lace_client.py standalone self-check passed successfully.")
 
     asyncio.run(_self_check())
-

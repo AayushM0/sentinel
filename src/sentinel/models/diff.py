@@ -86,9 +86,7 @@ def parse_git_diff(raw_diff: str) -> GitDiff:
                 continue
 
         # Header records exist only before the first @@ hunk marker
-        hunk_start_idx = next(
-            (i for i, l in enumerate(lines) if l.startswith("@@")), len(lines)
-        )
+        hunk_start_idx = next((i for i, l in enumerate(lines) if l.startswith("@@")), len(lines))
         header_lines = lines[:hunk_start_idx]
 
         change_type: FileChangeType = "modified"
@@ -146,7 +144,9 @@ index 1111111..2222222 100644
     assert len(parsed.files) == 1
     assert parsed.files[0].change_type == "modified", "Hunk text must not change file type"
     assert parsed.files[0].added_lines[0] == "    def new_code():", "Indentation must be preserved"
-    assert parsed.files[0].deleted_lines[0] == "    def old_code():", "Indentation must be preserved"
+    assert parsed.files[0].deleted_lines[0] == "    def old_code():", (
+        "Indentation must be preserved"
+    )
 
     # Octal unicode path self-check
     octal_sample = r"""diff --git "a/src/r\303\251sum\303\251.ts" "b/src/r\303\251sum\303\251.ts"
@@ -160,4 +160,3 @@ index 1111111..2222222 100644
     assert parsed_octal.files[0].path == "src/r\u00e9sum\u00e9.ts"
 
     print("diff.py standalone self-check passed successfully.")
-

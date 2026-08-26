@@ -115,7 +115,9 @@ index 1234567..89abcdef 100644
     git_diff = parse_git_diff(diff_text)
     assert len(git_diff.files) == 1
     file_diff = git_diff.files[0]
-    assert file_diff.change_type == "modified", "Must remain modified despite metadata words in hunk"
+    assert file_diff.change_type == "modified", (
+        "Must remain modified despite metadata words in hunk"
+    )
     assert file_diff.added_lines[0] == "    # new indentation with trailing spaces   "
     assert file_diff.deleted_lines[0] == "    # old indentation"
 
@@ -124,4 +126,3 @@ if __name__ == "__main__":
     test_parse_git_diff_whitespace_and_hunk_metadata()
     test_parse_git_diff_unicode_octal_escapes()
     print("test_diff.py standalone checks passed.")
-

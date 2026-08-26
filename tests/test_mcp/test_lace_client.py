@@ -64,7 +64,6 @@ async def test_lace_client_mock_methods():
     assert res.status == "ok"
 
 
-
 @pytest.mark.asyncio
 async def test_lace_client_not_connected_raises():
     client = LaceMcpClient()

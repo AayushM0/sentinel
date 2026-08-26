@@ -113,13 +113,17 @@ def test_approval_gate_strict_input_rejection(monkeypatch, temp_store: SessionSt
     # Ambiguous input like "abort" or "apple" must REJECT
     monkeypatch.setattr("builtins.input", lambda _: "abort")
     session_reject = temp_store.create_session(branch_name="feat/reject", commit_sha="111222")
-    decision = gate.request_approval(session=session_reject, test_result={"exit_code": 0}, delta_report={}, interactive=True)
+    decision = gate.request_approval(
+        session=session_reject, test_result={"exit_code": 0}, delta_report={}, interactive=True
+    )
     assert decision == ApprovalDecision.REJECTED
 
     # Exact "approve" must APPROVE — fresh session since rejected sessions are terminal
     monkeypatch.setattr("builtins.input", lambda _: "approve")
     session_approve = temp_store.create_session(branch_name="feat/approve", commit_sha="333444")
-    decision2 = gate.request_approval(session=session_approve, test_result={"exit_code": 0}, delta_report={}, interactive=True)
+    decision2 = gate.request_approval(
+        session=session_approve, test_result={"exit_code": 0}, delta_report={}, interactive=True
+    )
     assert decision2 == ApprovalDecision.APPROVED
 
 
@@ -127,4 +131,3 @@ if __name__ == "__main__":
     test_generate_approval_card()
     test_approval_gate_crashed_runner_shows_failure()
     print("test_approval_gate.py standalone checks passed.")
-

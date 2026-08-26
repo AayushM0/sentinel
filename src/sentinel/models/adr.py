@@ -72,4 +72,3 @@ if __name__ == "__main__":
     assert reparsed.title == "Test Policy"
     assert reparsed.body == "Policy body."
     print("adr.py standalone self-check passed successfully.")
-

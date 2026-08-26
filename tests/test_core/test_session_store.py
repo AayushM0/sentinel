@@ -278,4 +278,3 @@ if __name__ == "__main__":
         s = store.create_session("main", "111")
         assert s.status == SessionStatus.PENDING_SUBAGENTS
     print("test_session_store.py standalone checks passed.")
-
