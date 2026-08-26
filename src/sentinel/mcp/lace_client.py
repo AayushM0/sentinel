@@ -1,28 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import shutil
+import sys
 import types
 from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any, Self
 
 import yaml
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from sentinel.mcp.types import LaceContextResponse, LaceMemoryItem
 from sentinel.models.adr import ADR
 
 
 def _default_server_config() -> tuple[str, list[str], dict[str, str]]:
-    import sys
-    from pathlib import Path
-
     env_lace_path = os.environ.get("LACE_PATH")
     if env_lace_path:
         lace_dir = Path(env_lace_path)
     else:
-        candidate = Path(r"D:\Projects\LACE")
-        lace_dir = candidate if candidate.exists() else Path.cwd()
+        lace_dir = Path.cwd()
 
     env_lace_python = os.environ.get("LACE_PYTHON")
     if env_lace_python:
@@ -35,10 +36,11 @@ def _default_server_config() -> tuple[str, list[str], dict[str, str]]:
         elif posix_venv.exists():
             cmd = str(posix_venv)
         else:
-            cmd = sys.executable or "python"
+            cmd = sys.executable or shutil.which("python") or "python"
 
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(lace_dir / "src")
+    if (lace_dir / "src").exists():
+        env["PYTHONPATH"] = str(lace_dir / "src")
     env["PYTHONUNBUFFERED"] = "1"
     env["HF_HUB_OFFLINE"] = "1"
     env["TRANSFORMERS_OFFLINE"] = "1"
@@ -70,7 +72,7 @@ class LaceMcpClient:
         self._is_connected: bool = False
 
     async def connect(self) -> None:
-        """Establish stdio MCP connection to LACE server."""
+        """Establish stdio MCP connection to LACE server with leak-proof cleanup on failure."""
         if self._is_connected and self._session is not None:
             return
 
@@ -81,14 +83,22 @@ class LaceMcpClient:
             env=self.server_env,
         )
 
-        read_stream, write_stream = await self._exit_stack.enter_async_context(
-            stdio_client(server_params)
-        )
-        self._session = await self._exit_stack.enter_async_context(
-            ClientSession(read_stream, write_stream)
-        )
-        await self._session.initialize()
-        self._is_connected = True
+        try:
+            read_stream, write_stream = await self._exit_stack.enter_async_context(
+                stdio_client(server_params)
+            )
+            self._session = await self._exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
+            await self._session.initialize()
+            self._is_connected = True
+        except Exception:
+            if self._exit_stack is not None:
+                await self._exit_stack.aclose()
+                self._exit_stack = None
+            self._session = None
+            self._is_connected = False
+            raise
 
     async def close(self) -> None:
         """Close stdio MCP session and terminate background processes."""
@@ -125,6 +135,11 @@ class LaceMcpClient:
         full_query = f"{query} {' '.join(touched_files)}".strip()
 
         result = await session.call_tool("get_relevant_context", {"query": full_query})
+
+        if getattr(result, "is_error", False) is True:
+            raise RuntimeError(
+                f"LACE get_relevant_context tool failed: {getattr(result, 'content', '')}"
+            )
 
         adrs: list[ADR] = []
         if not result.content:
@@ -193,8 +208,8 @@ class LaceMcpClient:
         query: str,
         category: str = "decision",
         max_results: int = 5,
-    ) -> list[dict[str, Any]]:
-        """Perform semantic search against LACE memory vault."""
+    ) -> list[LaceMemoryItem]:
+        """Perform semantic search against LACE memory vault with schema validation (Rule 2903657)."""
         session = self._ensure_connected()
         result = await session.call_tool(
             "search_memory",
@@ -204,29 +219,91 @@ class LaceMcpClient:
                 "max_results": max_results,
             },
         )
+        if getattr(result, "is_error", False) is True:
+            raise RuntimeError(
+                f"LACE search_memory tool failed: {getattr(result, 'content', '')}"
+            )
+
         if not result.content:
             return []
 
+        items: list[LaceMemoryItem] = []
         try:
-            return json.loads(result.content[0].text)
-        except (json.JSONDecodeError, AttributeError):
-            return [{"raw": c.text} for c in result.content]
+            raw_data = json.loads(result.content[0].text)
+            if isinstance(raw_data, list):
+                for item in raw_data:
+                    if isinstance(item, dict):
+                        items.append(LaceMemoryItem(**item))
+                    else:
+                        items.append(LaceMemoryItem(raw=str(item)))
+            elif isinstance(raw_data, dict):
+                items.append(LaceMemoryItem(**raw_data))
+        except (json.JSONDecodeError, AttributeError, ValueError):
+            for c in result.content:
+                items.append(LaceMemoryItem(raw=getattr(c, "text", str(c))))
+
+        return items
 
     async def set_context(
         self,
         working_directory: str,
         project_name: str | None = None,
-    ) -> dict[str, Any]:
-        """Update LACE active workspace directory and project scope."""
+    ) -> LaceContextResponse:
+        """Update LACE active workspace directory and project scope with schema validation."""
         session = self._ensure_connected()
         args: dict[str, Any] = {"working_directory": working_directory}
         if project_name:
             args["project_name"] = project_name
 
         result = await session.call_tool("set_context", args)
+        if getattr(result, "is_error", False) is True:
+            raise RuntimeError(
+                f"LACE set_context tool failed: {getattr(result, 'content', '')}"
+            )
+
         if not result.content:
-            return {}
+            return LaceContextResponse()
+
         try:
-            return json.loads(result.content[0].text)
-        except (json.JSONDecodeError, AttributeError):
-            return {"raw": result.content[0].text}
+            data = json.loads(result.content[0].text)
+            if isinstance(data, dict):
+                return LaceContextResponse(**data)
+            return LaceContextResponse(message=str(data))
+        except (json.JSONDecodeError, AttributeError, ValueError):
+            return LaceContextResponse(message=getattr(result.content[0], "text", ""))
+
+
+if __name__ == "__main__":
+    # Framework-free self-check (Rule 2903681)
+    async def _self_check():
+        from unittest.mock import AsyncMock, MagicMock
+
+        client = LaceMcpClient()
+        mock_sess = AsyncMock()
+
+        # 1. Test schema validation on search_memory
+        mock_search_res = MagicMock()
+        mock_search_res.is_error = False
+        mock_search_res.content = [MagicMock(text=json.dumps([{"id": "mem_1", "title": "SelfCheck", "content": "Ok"}]))]
+        mock_sess.call_tool = AsyncMock(return_value=mock_search_res)
+        client._session = mock_sess
+        client._is_connected = True
+
+        results = await client.search_memory("query")
+        assert len(results) == 1
+        assert isinstance(results[0], LaceMemoryItem)
+        assert results[0].id == "mem_1"
+
+        # 2. Test schema validation on set_context
+        mock_ctx_res = MagicMock()
+        mock_ctx_res.is_error = False
+        mock_ctx_res.content = [MagicMock(text=json.dumps({"status": "active", "project": "sentinel"}))]
+        mock_sess.call_tool = AsyncMock(return_value=mock_ctx_res)
+        ctx = await client.set_context("D:/sentinel")
+        assert isinstance(ctx, LaceContextResponse)
+        assert ctx.project == "sentinel"
+
+        print("lace_client.py standalone self-check passed successfully.")
+
+    asyncio.run(_self_check())
+

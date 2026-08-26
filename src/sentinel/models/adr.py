@@ -61,3 +61,15 @@ class ADR(BaseModel):
         cleaned_meta = {k: v for k, v in meta.items() if v is not None}
         frontmatter = yaml.safe_dump(cleaned_meta, sort_keys=False, allow_unicode=True)
         return f"---\n{frontmatter}---\n\n{self.body}\n"
+
+
+if __name__ == "__main__":
+    # Framework-free self-check (Rule 2903681)
+    adr = ADR(id="ADR-001", title="Test Policy", status="accepted", body="Policy body.")
+    md = adr.to_markdown()
+    reparsed = ADR.from_markdown(md)
+    assert reparsed.id == "ADR-001"
+    assert reparsed.title == "Test Policy"
+    assert reparsed.body == "Policy body."
+    print("adr.py standalone self-check passed successfully.")
+

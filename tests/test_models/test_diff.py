@@ -100,3 +100,28 @@ index 1111111..2222222 100644
     assert len(git_diff.files) == 1
     assert git_diff.touched_files == ["src/t\u00e9st.ts"]
     assert git_diff.files[0].path == "src/t\u00e9st.ts"
+
+
+def test_parse_git_diff_whitespace_and_hunk_metadata():
+    diff_text = """diff --git a/src/app.py b/src/app.py
+index 1234567..89abcdef 100644
+--- a/src/app.py
++++ b/src/app.py
+@@ -10,3 +10,4 @@ def run():
+-    # old indentation
++    # new indentation with trailing spaces   
++    print("deleted file mode in string")
+"""
+    git_diff = parse_git_diff(diff_text)
+    assert len(git_diff.files) == 1
+    file_diff = git_diff.files[0]
+    assert file_diff.change_type == "modified", "Must remain modified despite metadata words in hunk"
+    assert file_diff.added_lines[0] == "    # new indentation with trailing spaces   "
+    assert file_diff.deleted_lines[0] == "    # old indentation"
+
+
+if __name__ == "__main__":
+    test_parse_git_diff_whitespace_and_hunk_metadata()
+    test_parse_git_diff_unicode_octal_escapes()
+    print("test_diff.py standalone checks passed.")
+

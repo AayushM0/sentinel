@@ -78,11 +78,30 @@ class SessionStore:
                     user_decision TEXT NOT NULL,
                     decided_at TEXT
                 );
-
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_subagent_tasks_session_task 
-                ON subagent_tasks(session_id, task_id);
                 """
             )
+            # Schema migration check: ensure subagent_tasks has composite primary key
+            table_info = conn.execute("PRAGMA table_info(subagent_tasks);").fetchall()
+            pk_cols = [r["name"] for r in table_info if r["pk"] > 0]
+            if pk_cols and "session_id" not in pk_cols:
+                # Legacy table detected with task_id PRIMARY KEY only - execute table rebuild migration
+                conn.executescript(
+                    """
+                    CREATE TABLE subagent_tasks_v2 (
+                        task_id TEXT NOT NULL,
+                        session_id TEXT NOT NULL REFERENCES review_sessions(session_id),
+                        subagent_type TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        result_payload TEXT,
+                        completed_at TEXT,
+                        PRIMARY KEY (session_id, task_id)
+                    );
+                    INSERT OR IGNORE INTO subagent_tasks_v2 (task_id, session_id, subagent_type, status, result_payload, completed_at)
+                    SELECT task_id, session_id, subagent_type, status, result_payload, completed_at FROM subagent_tasks;
+                    DROP TABLE subagent_tasks;
+                    ALTER TABLE subagent_tasks_v2 RENAME TO subagent_tasks;
+                    """
+                )
 
     def create_session(
         self,
@@ -168,6 +187,18 @@ class SessionStore:
         now = datetime.now(UTC).isoformat()
 
         with self._get_connection() as conn:
+            sess_row = conn.execute(
+                "SELECT status FROM review_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if not sess_row:
+                raise ValueError(f"Session {session_id} not found")
+
+            curr_status = SessionStatus(sess_row["status"])
+            if curr_status in (SessionStatus.COMPLETED, SessionStatus.REJECTED):
+                raise ValueError(
+                    f"Cannot request approval for terminal session in status {curr_status.value}"
+                )
+
             conn.execute(
                 """
                 INSERT INTO pending_approvals (approval_id, session_id, action_type, payload, user_decision, decided_at)
@@ -266,6 +297,9 @@ class SessionStore:
 
     def resolve_approval(self, approval_id: str, decision: ApprovalDecision) -> None:
         """Record the user's decision at the approval gate with stale resolution protection."""
+        if decision not in (ApprovalDecision.APPROVED, ApprovalDecision.REJECTED):
+            raise ValueError(f"Cannot resolve approval with non-final decision {decision.value}")
+
         now = datetime.now(UTC).isoformat()
         with self._get_connection() as conn:
             appr = conn.execute(
@@ -309,3 +343,34 @@ class SessionStore:
                 "UPDATE review_sessions SET status = ?, updated_at = ? WHERE session_id = ?",
                 (SessionStatus.COMPLETED.value, now, session_id),
             )
+
+
+if __name__ == "__main__":
+    # Framework-free self-check (Rule 2903681)
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_db = str(Path(tmpdir) / "test.db")
+        store = SessionStore(db_path=test_db)
+        sess = store.create_session("main", "abc1234", "Diff test")
+        assert sess.status == SessionStatus.PENDING_SUBAGENTS
+
+        task = store.save_subagent_result(
+            sess.session_id, SubagentType.SANDBOX_RUNNER, SubagentStatus.COMPLETED, {"tests": 5}
+        )
+        assert task.status == SubagentStatus.COMPLETED
+
+        appr = store.set_pending_approval(
+            sess.session_id, ApprovalActionType.PRE_PUSH_COMMIT, {"card": "Test"}
+        )
+        assert appr.user_decision == ApprovalDecision.PENDING
+
+        store.resolve_approval(appr.approval_id, ApprovalDecision.APPROVED)
+        hydrated = store.get_session(sess.session_id)
+        assert hydrated is not None and hydrated.status == SessionStatus.APPROVED
+
+        store.mark_completed(sess.session_id)
+        assert store.get_session(sess.session_id).status == SessionStatus.COMPLETED
+
+    print("SessionStore standalone self-check passed successfully.")
+

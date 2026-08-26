@@ -224,13 +224,58 @@ def test_session_store_legacy_db_migration(tmp_path):
 
     # Now initialize SessionStore on this pre-existing database
     store = SessionStore(db_path=str(db_file))
-    sess = store.create_session(branch_name="feat/legacy", commit_sha="123456")
+    sess1 = store.create_session(branch_name="feat/legacy1", commit_sha="123456")
+    sess2 = store.create_session(branch_name="feat/legacy2", commit_sha="654321")
 
-    # Upserting subagent task must succeed via index migration
-    task = store.save_subagent_result(
-        session_id=sess.session_id,
+    # Upserting identical task_id in two distinct sessions must succeed on migrated DB
+    task1 = store.save_subagent_result(
+        session_id=sess1.session_id,
         subagent_type=SubagentType.SANDBOX_RUNNER,
         status=SubagentStatus.COMPLETED,
-        result_payload={"legacy_migration": "success"},
+        result_payload={"legacy_migration": "sess1"},
+        task_id="shared_task",
     )
-    assert task.status == SubagentStatus.COMPLETED
+    task2 = store.save_subagent_result(
+        session_id=sess2.session_id,
+        subagent_type=SubagentType.SANDBOX_RUNNER,
+        status=SubagentStatus.COMPLETED,
+        result_payload={"legacy_migration": "sess2"},
+        task_id="shared_task",
+    )
+    assert task1.status == SubagentStatus.COMPLETED
+    assert task2.status == SubagentStatus.COMPLETED
+
+
+def test_session_store_terminal_session_cannot_reopen(temp_store: SessionStore):
+    session = temp_store.create_session(branch_name="feat/terminal", commit_sha="sha999")
+    temp_store.mark_completed(session.session_id)
+
+    # Attempting to set pending approval on completed session must raise ValueError
+    with pytest.raises(ValueError, match="Cannot request approval for terminal session"):
+        temp_store.set_pending_approval(
+            session_id=session.session_id,
+            action_type=ApprovalActionType.PRE_PUSH_COMMIT,
+            payload={},
+        )
+
+
+def test_session_store_nonfinal_decision_raises(temp_store: SessionStore):
+    session = temp_store.create_session(branch_name="feat/test", commit_sha="sha888")
+    appr = temp_store.set_pending_approval(
+        session_id=session.session_id,
+        action_type=ApprovalActionType.PRE_PUSH_COMMIT,
+        payload={},
+    )
+    with pytest.raises(ValueError, match="Cannot resolve approval with non-final decision"):
+        temp_store.resolve_approval(appr.approval_id, ApprovalDecision.PENDING)
+
+
+if __name__ == "__main__":
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = SessionStore(db_path=str(Path(tmpdir) / "test.db"))
+        s = store.create_session("main", "111")
+        assert s.status == SessionStatus.PENDING_SUBAGENTS
+    print("test_session_store.py standalone checks passed.")
+

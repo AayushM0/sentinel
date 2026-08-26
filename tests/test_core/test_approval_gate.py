@@ -87,3 +87,44 @@ def test_approval_gate_create_and_resolve(temp_store: SessionStore):
     resolved = temp_store.get_session(session.session_id)
     assert resolved.status == SessionStatus.APPROVED
     assert resolved.pending_approval.user_decision == ApprovalDecision.APPROVED
+
+
+def test_approval_gate_crashed_runner_shows_failure():
+    gate = ApprovalGate()
+    crashed_result = {
+        "sandbox_status": "crashed",
+        "exit_code": 1,
+        "tests_passed": 0,
+        "tests_failed": 0,
+    }
+    card = gate.format_approval_card(
+        session_id="sess_crashed",
+        branch_name="feat/crash",
+        commit_sha="c0ffee1",
+        test_result=crashed_result,
+        delta_report={},
+    )
+    assert "**Status:** `FAILURE`" in card
+
+
+def test_approval_gate_strict_input_rejection(monkeypatch, temp_store: SessionStore):
+    gate = ApprovalGate(session_store=temp_store)
+
+    # Ambiguous input like "abort" or "apple" must REJECT
+    monkeypatch.setattr("builtins.input", lambda _: "abort")
+    session_reject = temp_store.create_session(branch_name="feat/reject", commit_sha="111222")
+    decision = gate.request_approval(session=session_reject, test_result={"exit_code": 0}, delta_report={}, interactive=True)
+    assert decision == ApprovalDecision.REJECTED
+
+    # Exact "approve" must APPROVE — fresh session since rejected sessions are terminal
+    monkeypatch.setattr("builtins.input", lambda _: "approve")
+    session_approve = temp_store.create_session(branch_name="feat/approve", commit_sha="333444")
+    decision2 = gate.request_approval(session=session_approve, test_result={"exit_code": 0}, delta_report={}, interactive=True)
+    assert decision2 == ApprovalDecision.APPROVED
+
+
+if __name__ == "__main__":
+    test_generate_approval_card()
+    test_approval_gate_crashed_runner_shows_failure()
+    print("test_approval_gate.py standalone checks passed.")
+

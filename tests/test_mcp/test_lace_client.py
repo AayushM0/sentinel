@@ -54,14 +54,15 @@ async def test_lace_client_mock_methods():
     ok = await client.commit_adr(new_adr)
     assert ok is True
 
-    # Test search_memory
+    # Test search_memory — now returns list[LaceMemoryItem]
     memories = await client.search_memory("storage")
     assert len(memories) == 1
-    assert memories[0]["id"] == "ADR-014"
+    assert memories[0].id == "ADR-014"
 
-    # Test set_context
+    # Test set_context — now returns LaceContextResponse
     res = await client.set_context(r"D:\agentHarness\sentinel")
-    assert res.get("status") == "ok"
+    assert res.status == "ok"
+
 
 
 @pytest.mark.asyncio
