@@ -378,6 +378,145 @@ async def test_sandbox_runner_end_to_end_approval_gate_integration(tmp_path, mon
     assert updated_session.status.value == "APPROVED"
 
 
+@pytest.mark.asyncio
+async def test_sandbox_runner_dependency_failure(basic_request):
+    """Nonzero exit code in pip install / uv sync returns error status and halts test run."""
+    sandbox = _make_mock_sandbox(
+        [
+            _make_exec_response(1, "error: package not found"),  # uv sync fails
+        ]
+    )
+    client = _make_mock_client(sandbox)
+
+    with patch("sentinel.subagents.sandbox_runner.AsyncDaytona") as MockDaytona:
+        MockDaytona.return_value.__aenter__ = AsyncMock(return_value=client)
+        MockDaytona.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        result = await SandboxRunner().run(basic_request)
+
+    assert result.sandbox_status == "error"
+    assert result.exit_code == 1
+    assert "Dependency installation failed" in result.logs
+    client.delete.assert_called_once_with(sandbox)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_linter_timeout_or_crash_non_fatal(basic_request):
+    """Linter raising exception or timing out is non-fatal; tests still run."""
+    sandbox = _make_mock_sandbox(
+        [
+            _make_exec_response(0, ""),  # uv sync
+            RuntimeError("Linter daemon timed out"),  # linter command crashes
+            _make_exec_response(0, "7 passed in 0.5s"),  # pytest runs successfully
+        ]
+    )
+    client = _make_mock_client(sandbox)
+
+    req = SandboxRequest(
+        session_id=basic_request.session_id,
+        project_root=basic_request.project_root,
+        changed_files=basic_request.changed_files,
+        test_command=basic_request.test_command,
+        linter_command="ruff check src",
+        timeout_seconds=30,
+    )
+
+    with patch("sentinel.subagents.sandbox_runner.AsyncDaytona") as MockDaytona:
+        MockDaytona.return_value.__aenter__ = AsyncMock(return_value=client)
+        MockDaytona.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        result = await SandboxRunner().run(req)
+
+    assert result.sandbox_status == "completed"
+    assert result.exit_code == 0
+    assert result.tests_passed == 7
+    assert len(result.linter_errors) == 1
+    assert "Linter execution error" in result.linter_errors[0]
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_delete_retry_and_leak_logging(basic_request):
+    """If client.delete() fails, it retries and surfaces leak info in logs."""
+    sandbox = _make_mock_sandbox(
+        [
+            _make_exec_response(0, ""),
+            _make_exec_response(0, "2 passed in 0.1s"),
+        ]
+    )
+    sandbox.id = "sbx_leak_999"
+    client = AsyncMock()
+    client.create = AsyncMock(return_value=sandbox)
+    client.delete = AsyncMock(side_effect=RuntimeError("API Gateway 502"))
+
+    with patch("sentinel.subagents.sandbox_runner.AsyncDaytona") as MockDaytona:
+        MockDaytona.return_value.__aenter__ = AsyncMock(return_value=client)
+        MockDaytona.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        result = await SandboxRunner().run(basic_request)
+
+    assert client.delete.call_count == 3
+    assert "[CLEANUP ERROR]" in result.logs
+    assert "LEAKED_SANDBOX_sbx_leak_999" in result.logs
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_escaped_symlink_upload_rejected(tmp_path):
+    """Paths escaping project_root via symlinks or traversal are omitted from upload."""
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname='p'\n")
+    outside_file = tmp_path / "outside.txt"
+    outside_file.write_text("secret_data")
+
+    runner = SandboxRunner()
+    paths = runner._collect_upload_paths(root, [str(outside_file)])
+    assert outside_file not in paths
+
+
+@pytest.mark.asyncio
+async def test_sandbox_runner_uploads_all_workspace_files(tmp_path):
+    """Unchanged files in project root (README, fixtures) are collected and uploaded."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='all_ws'\n")
+    (tmp_path / "README.md").write_text("# Readme\n")
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    (test_dir / "conftest.py").write_text("# fixtures\n")
+    (test_dir / "test_a.py").write_text("def test_ok(): pass\n")
+
+    changed = tmp_path / "src" / "new.py"
+    changed.parent.mkdir()
+    changed.write_text("y = 2\n")
+
+    req = SandboxRequest(
+        session_id="sess_all_ws",
+        project_root=str(tmp_path),
+        changed_files=[str(changed)],
+        test_command="pytest",
+    )
+
+    sandbox = _make_mock_sandbox(
+        [
+            _make_exec_response(0, ""),
+            _make_exec_response(0, "1 passed in 0.1s"),
+        ]
+    )
+    client = _make_mock_client(sandbox)
+
+    with patch("sentinel.subagents.sandbox_runner.AsyncDaytona") as MockDaytona:
+        MockDaytona.return_value.__aenter__ = AsyncMock(return_value=client)
+        MockDaytona.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        result = await SandboxRunner().run(req)
+
+    assert result.sandbox_status == "completed"
+    uploaded_dests = [call.args[1] for call in sandbox.fs.upload_file.call_args_list]
+    assert "/workspace/pyproject.toml" in uploaded_dests
+    assert "/workspace/README.md" in uploaded_dests
+    assert "/workspace/tests/conftest.py" in uploaded_dests
+    assert "/workspace/tests/test_a.py" in uploaded_dests
+    assert "/workspace/src/new.py" in uploaded_dests
+
+
 # ---------------------------------------------------------------------------
 # _parse_pytest_output unit tests (pure, no mocks needed)
 # ---------------------------------------------------------------------------

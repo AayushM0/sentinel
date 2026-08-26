@@ -24,14 +24,9 @@ async def live_daytona_test() -> None:
 
     project_root = Path(__file__).resolve().parent.parent
 
-    # Collect real project files to upload to cloud sandbox
-    source_files: list[str] = []
-    for ext in ("*.py", "*.toml", "*.lock", "*.md"):
-        for p in project_root.rglob(ext):
-            if ".venv" not in p.parts and ".pytest_cache" not in p.parts and ".git" not in p.parts:
-                source_files.append(str(p))
-
-    print(f"\n[1] Found {len(source_files)} project files to upload to Daytona sandbox.")
+    # SandboxRunner automatically uploads the full workspace (pyproject.toml, README.md, fixtures)
+    # changed_files specifies the specific files under review
+    changed_files = [str(project_root / "src" / "sentinel" / "subagents" / "sandbox_runner.py")]
 
     store = SessionStore(db_path="sentinel_live.db")
     session = store.create_session(
@@ -39,12 +34,12 @@ async def live_daytona_test() -> None:
         commit_sha="3631908",
         diff_summary="Add Daytona Sandbox Runner with real cloud test execution",
     )
-    print(f"[2] Created Review Session: `{session.session_id}` in SQLite")
+    print(f"[1] Created Review Session: `{session.session_id}` in SQLite")
 
     req = SandboxRequest(
         session_id=session.session_id,
         project_root=str(project_root),
-        changed_files=source_files,
+        changed_files=changed_files,
         linter_command="uv run ruff check src",
         test_command="uv run pytest tests/test_models/test_adr.py tests/test_models/test_diff.py -v",
         timeout_seconds=120,

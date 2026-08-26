@@ -6,19 +6,32 @@ a typed SandboxResult. The sandbox is always deleted on exit.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import shlex
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from daytona import (
-    AsyncDaytona,
-    CreateSandboxFromImageParams,
-    DaytonaProcessExecutionTimeoutError,
-    Image,
-)
+try:
+    from daytona import (
+        AsyncDaytona,
+        CreateSandboxFromImageParams,
+        DaytonaProcessExecutionTimeoutError,
+        Image,
+    )
+except ImportError:  # pragma: no cover
+    AsyncDaytona = None  # type: ignore[misc,assignment]
+    CreateSandboxFromImageParams = None  # type: ignore[misc,assignment]
+    DaytonaProcessExecutionTimeoutError = type(
+        "DaytonaProcessExecutionTimeoutError", (Exception,), {}
+    )  # type: ignore[misc,assignment]
+    Image = None  # type: ignore[misc,assignment]
 
 from sentinel.models.review_state import SubagentStatus, SubagentType
 from sentinel.session_store import SessionStore
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Data contracts (match TRD §3.3 exactly)
@@ -63,6 +76,22 @@ class SandboxResult:
 
 _WORKSPACE = "/workspace"
 _DEPS_TIMEOUT = 120  # seconds for uv sync — separate from test timeout
+_IGNORED_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".tox",
+    "dist",
+    "build",
+    ".eggs",
+    ".lace",
+    ".idea",
+    ".vscode",
+}
 
 
 class SandboxRunner:
@@ -81,6 +110,7 @@ class SandboxRunner:
         """Create a Daytona sandbox, run tests, delete sandbox, return result."""
         start = time.monotonic()
         sandbox = None
+        cleanup_error: str | None = None
 
         try:
             async with AsyncDaytona() as client:
@@ -94,7 +124,7 @@ class SandboxRunner:
                     result = await self._run_in_sandbox(client, sandbox, request, start)
                 finally:
                     if sandbox is not None:
-                        await client.delete(sandbox)
+                        cleanup_error = await self._delete_sandbox_with_retry(client, sandbox)
 
         except DaytonaProcessExecutionTimeoutError:
             result = SandboxResult(
@@ -104,7 +134,7 @@ class SandboxRunner:
                 tests_failed=0,
                 linter_errors=[],
                 duration_ms=int((time.monotonic() - start) * 1000),
-                logs="",
+                logs="Daytona process execution timed out.",
             )
         except Exception as exc:  # noqa: BLE001
             result = SandboxResult(
@@ -117,8 +147,40 @@ class SandboxRunner:
                 logs=str(exc),
             )
 
+        if cleanup_error:
+            result.logs = f"{result.logs}\n\n[CLEANUP ERROR] {cleanup_error}".strip()
+
         self._persist(request, result)
         return result
+
+    async def _delete_sandbox_with_retry(
+        self,
+        client: AsyncDaytona,
+        sandbox,
+        max_retries: int = 3,
+    ) -> str | None:
+        """Attempt sandbox deletion with bounded retries; returns error message if leaked."""
+        sandbox_id = getattr(sandbox, "id", None) or repr(sandbox)
+        last_exc: Exception | None = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                await client.delete(sandbox)
+                return None
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                logger.warning(
+                    "Sandbox deletion attempt %d/%d failed for %s: %s",
+                    attempt,
+                    max_retries,
+                    sandbox_id,
+                    exc,
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(0.1 * (2 ** (attempt - 1)))
+
+        leak_msg = f"LEAKED_SANDBOX_{sandbox_id}: Failed to delete after {max_retries} attempts ({last_exc})"
+        logger.critical(leak_msg)
+        return leak_msg
 
     async def _run_in_sandbox(
         self,
@@ -128,24 +190,37 @@ class SandboxRunner:
         start: float,
     ) -> SandboxResult:
         """Upload files, install deps, run linter + tests, return result."""
-        # 1. Upload changed files + project metadata
+        # 1. Upload workspace files + changed files
         await self._upload_files(sandbox, request)
 
         # 2. Install dependencies (fixed timeout, separate from test timeout)
-        await sandbox.process.exec(
+        dep_res = await sandbox.process.exec(
             f"cd {_WORKSPACE} && pip install uv -q && uv sync --dev",
             timeout=_DEPS_TIMEOUT,
         )
+        if dep_res.exit_code != 0:
+            return SandboxResult(
+                sandbox_status="error",
+                exit_code=dep_res.exit_code,
+                tests_passed=0,
+                tests_failed=0,
+                linter_errors=[],
+                duration_ms=int((time.monotonic() - start) * 1000),
+                logs=f"Dependency installation failed (exit code {dep_res.exit_code}):\n{dep_res.result}",
+            )
 
-        # 3. Run linter (optional, non-fatal)
+        # 3. Run linter (optional, non-fatal — errors or timeouts isolated)
         linter_errors: list[str] = []
         if request.linter_command:
-            lr = await sandbox.process.exec(
-                f"cd {_WORKSPACE} && {request.linter_command}",
-                timeout=request.timeout_seconds,
-            )
-            if lr.exit_code != 0:
-                linter_errors = [line for line in lr.result.splitlines() if line.strip()]
+            try:
+                lr = await sandbox.process.exec(
+                    f"cd {_WORKSPACE} && {request.linter_command}",
+                    timeout=request.timeout_seconds,
+                )
+                if lr.exit_code != 0:
+                    linter_errors = [line for line in lr.result.splitlines() if line.strip()]
+            except Exception as exc:  # noqa: BLE001
+                linter_errors = [f"Linter execution error (non-fatal): {exc}"]
 
         # 4. Run test command (authoritative for sandbox_status)
         tr = await sandbox.process.exec(
@@ -165,29 +240,68 @@ class SandboxRunner:
             logs=tr.result,
         )
 
-    async def _upload_files(self, sandbox, request: SandboxRequest) -> None:
-        """Upload changed files + pyproject.toml + uv.lock into /workspace."""
-        root = Path(request.project_root)
+    def _collect_upload_paths(self, root: Path, changed_files: list[str]) -> list[Path]:
+        """Collect all relevant workspace files and changed files, canonicalized."""
+        root_resolved = root.resolve()
+        candidates: set[Path] = set()
 
-        # Collect: changed files + project metadata
-        extras = [str(root / f) for f in ("pyproject.toml", "uv.lock") if (root / f).exists()]
-        paths = list(dict.fromkeys([*request.changed_files, *extras]))  # dedup, order preserved
+        if root_resolved.is_dir():
+            for item in root_resolved.rglob("*"):
+                if not item.is_file():
+                    continue
+                # Skip ignored directories
+                rel_parts = set(item.relative_to(root_resolved).parts)
+                if rel_parts.intersection(_IGNORED_DIRS):
+                    continue
+                candidates.add(item)
 
-        for local_path in paths:
-            p = Path(local_path)
-            if not p.exists():
-                continue  # deleted file in diff — skip silently
+        for cf in changed_files:
+            p = Path(cf)
             try:
-                rel = p.relative_to(root)
+                p_resolved = p.resolve()
+            except OSError:
+                continue
+            if (
+                p_resolved.exists()
+                and p_resolved.is_file()
+                and p_resolved.is_relative_to(root_resolved)
+            ):
+                candidates.add(p_resolved)
+
+        return sorted(candidates)
+
+    async def _upload_files(self, sandbox, request: SandboxRequest) -> None:
+        """Upload complete project workspace + changed files into /workspace."""
+        root = Path(request.project_root)
+        root_resolved = root.resolve()
+
+        paths = self._collect_upload_paths(root, request.changed_files)
+
+        for p in paths:
+            try:
+                p_resolved = p.resolve()
+            except OSError:
+                continue
+
+            if not p_resolved.exists() or not p_resolved.is_file():
+                continue
+
+            # Strict containment check against resolved root
+            try:
+                rel = p_resolved.relative_to(root_resolved)
             except ValueError:
-                continue  # outside project root — skip with no crash
+                # Outside project root or escaping symlink — skip safely
+                continue
+
+            # Double-check relative path components do not contain parent traversal
+            if ".." in rel.parts:
+                continue
 
             dest = f"{_WORKSPACE}/{rel.as_posix()}"
-            # Ensure parent directory exists in sandbox
             parent = Path(dest).parent.as_posix()
             if parent != _WORKSPACE:
-                await sandbox.process.exec(f"mkdir -p {parent}")
-            await sandbox.fs.upload_file(p.read_bytes(), dest)
+                await sandbox.process.exec(f"mkdir -p {shlex.quote(parent)}")
+            await sandbox.fs.upload_file(p_resolved.read_bytes(), dest)
 
     def _parse_pytest_output(self, logs: str) -> tuple[int, int]:
         """Extract (passed, failed) counts from pytest summary line.
@@ -231,26 +345,24 @@ class SandboxRunner:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import tempfile
+
     runner = SandboxRunner()
 
-    # Standard summary line
+    # 1. Output parser checks
     p, f = runner._parse_pytest_output("5 passed, 2 failed in 1.23s")
-    assert p == 5, f"Expected 5 passed, got {p}"
-    assert f == 2, f"Expected 2 failed, got {f}"
+    assert p == 5 and f == 2, f"Expected (5, 2), got ({p}, {f})"
 
-    # Empty output — exit_code carries the truth
     p2, f2 = runner._parse_pytest_output("")
     assert p2 == 0 and f2 == 0, "Empty output should yield (0, 0)"
 
-    # Compile error — no summary line
     p3, f3 = runner._parse_pytest_output("ERROR collecting tests/test_foo.py\nImportError: ...")
     assert p3 == 0 and f3 == 0, "Compile error output should yield (0, 0)"
 
-    # Passed only
     p4, f4 = runner._parse_pytest_output("32 passed in 1.38s")
     assert p4 == 32 and f4 == 0, f"Expected (32, 0), got ({p4}, {f4})"
 
-    # SandboxResult.to_dict roundtrip
+    # 2. SandboxResult contract
     sr = SandboxResult(
         sandbox_status="completed",
         exit_code=0,
@@ -263,13 +375,9 @@ if __name__ == "__main__":
     d = sr.to_dict()
     assert d["sandbox_status"] == "completed"
     assert d["exit_code"] == 0
+    assert sr.sandbox_status in ("completed", "success")
 
-    # Invariant: "completed" matches approval_gate.py check
-    assert sr.sandbox_status in ("completed", "success"), (
-        "sandbox_status must match approval_gate.py gate check"
-    )
-
-    # SandboxRequest rejects non-positive timeout
+    # 3. SandboxRequest rejects non-positive timeout
     try:
         SandboxRequest(
             session_id="s1",
@@ -278,8 +386,154 @@ if __name__ == "__main__":
             test_command="pytest",
             timeout_seconds=0,
         )
-        raise AssertionError("Should have raised ValueError")
+        raise AssertionError("Should have raised ValueError for timeout_seconds=0")
     except ValueError:
         pass
 
-    print("SandboxRunner standalone self-check passed.")
+    # 4. Async lifecycle self-checks with in-memory fakes
+    class FakeExecResult:
+        def __init__(self, exit_code: int, result: str):
+            self.exit_code = exit_code
+            self.result = result
+
+    class FakeFS:
+        def __init__(self):
+            self.uploaded: list[tuple[bytes, str]] = []
+
+        async def upload_file(self, data: bytes, dest: str) -> None:
+            self.uploaded.append((data, dest))
+
+    class FakeProcess:
+        def __init__(self, exec_handler):
+            self.exec_handler = exec_handler
+
+        async def exec(self, cmd: str, timeout: int | None = None):
+            return await self.exec_handler(cmd, timeout)
+
+    class FakeSandbox:
+        def __init__(self, exec_handler):
+            self.id = "sbx_test_123"
+            self.process = FakeProcess(exec_handler)
+            self.fs = FakeFS()
+
+    class FakeClient:
+        def __init__(self, sandbox, delete_exc=None):
+            self.sandbox = sandbox
+            self.delete_calls: list = []
+            self.delete_exc = delete_exc
+
+        async def create(self, params):
+            return self.sandbox
+
+        async def delete(self, sandbox):
+            self.delete_calls.append(sandbox)
+            if self.delete_exc:
+                raise self.delete_exc
+
+    async def run_lifecycle_checks():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmproot = Path(tmpdir)
+            (tmproot / "pyproject.toml").write_text("[project]\nname='test'\n")
+            (tmproot / "README.md").write_text("# Test\n")
+            src_dir = tmproot / "src"
+            src_dir.mkdir()
+            (src_dir / "mod.py").write_text("x = 1\n")
+
+            # Check A: Happy path lifecycle
+            async def happy_exec(cmd, timeout):
+                if "pip install" in cmd:
+                    return FakeExecResult(0, "Installed")
+                if "pytest" in cmd:
+                    return FakeExecResult(0, "3 passed in 0.5s")
+                return FakeExecResult(0, "")
+
+            sb_happy = FakeSandbox(happy_exec)
+            client_happy = FakeClient(sb_happy)
+
+            req = SandboxRequest(
+                session_id="s_happy",
+                project_root=str(tmproot),
+                changed_files=[str(src_dir / "mod.py")],
+                test_command="pytest",
+            )
+
+            runner_inst = SandboxRunner()
+            res_happy = await runner_inst._run_in_sandbox(
+                client_happy, sb_happy, req, time.monotonic()
+            )
+            assert res_happy.sandbox_status == "completed", f"Got {res_happy.sandbox_status}"
+            assert res_happy.exit_code == 0
+            assert res_happy.tests_passed == 3
+            # Check all workspace files uploaded
+            uploaded_dests = [dest for _, dest in sb_happy.fs.uploaded]
+            assert "/workspace/pyproject.toml" in uploaded_dests
+            assert "/workspace/README.md" in uploaded_dests
+            assert "/workspace/src/mod.py" in uploaded_dests
+
+            # Check B: Dependency installation failure
+            async def dep_fail_exec(cmd, timeout):
+                if "pip install" in cmd:
+                    return FakeExecResult(1, "Could not resolve dependencies")
+                return FakeExecResult(0, "3 passed")
+
+            sb_dep = FakeSandbox(dep_fail_exec)
+            res_dep = await runner_inst._run_in_sandbox(client_happy, sb_dep, req, time.monotonic())
+            assert res_dep.sandbox_status == "error", (
+                f"Expected error, got {res_dep.sandbox_status}"
+            )
+            assert res_dep.exit_code == 1
+            assert "Dependency installation failed" in res_dep.logs
+
+            # Check C: Linter timeout/error isolation (non-fatal)
+            async def linter_fail_exec(cmd, timeout):
+                if "pip install" in cmd:
+                    return FakeExecResult(0, "Installed")
+                if "ruff" in cmd:
+                    raise RuntimeError("Linter process crashed")
+                if "pytest" in cmd:
+                    return FakeExecResult(0, "4 passed in 0.2s")
+                return FakeExecResult(0, "")
+
+            sb_lint = FakeSandbox(linter_fail_exec)
+            req_lint = SandboxRequest(
+                session_id="s_lint",
+                project_root=str(tmproot),
+                changed_files=[],
+                test_command="pytest",
+                linter_command="ruff check",
+            )
+            res_lint = await runner_inst._run_in_sandbox(
+                client_happy, sb_lint, req_lint, time.monotonic()
+            )
+            assert res_lint.sandbox_status == "completed", (
+                "Linter crash must not abort test execution"
+            )
+            assert res_lint.tests_passed == 4
+            assert len(res_lint.linter_errors) == 1
+            assert "Linter execution error" in res_lint.linter_errors[0]
+
+            # Check D: Deletion retry and leak ID reporting
+            client_fail_delete = FakeClient(sb_happy, delete_exc=RuntimeError("Network disconnect"))
+            leak_msg = await runner_inst._delete_sandbox_with_retry(
+                client_fail_delete, sb_happy, max_retries=2
+            )
+            assert leak_msg is not None
+            assert "LEAKED_SANDBOX_sbx_test_123" in leak_msg
+            assert len(client_fail_delete.delete_calls) == 2
+
+            # Check E: Symlink escaping project root is rejected
+            symlink_dir = tmproot / "sym_dir"
+            symlink_dir.mkdir()
+            escaped_target = Path(tmpdir).parent / "outside_secret.txt"
+            escaped_target.write_text("secret")
+            symlink_file = symlink_dir / "link.txt"
+            try:
+                symlink_file.symlink_to(escaped_target)
+                upload_paths = runner_inst._collect_upload_paths(tmproot, [str(symlink_file)])
+                # Resolved symlink must not be in upload paths
+                assert not any(p.resolve() == escaped_target.resolve() for p in upload_paths)
+            except (OSError, NotImplementedError):
+                pass  # Symlinks might require elevation on some Windows environments
+
+    asyncio.run(run_lifecycle_checks())
+    print("SandboxRunner standalone self-check (Rule 2903681) passed.")
