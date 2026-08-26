@@ -184,7 +184,7 @@ class SandboxRunner:
 
             dest = f"{_WORKSPACE}/{rel.as_posix()}"
             # Ensure parent directory exists in sandbox
-            parent = str(Path(dest).parent)
+            parent = Path(dest).parent.as_posix()
             if parent != _WORKSPACE:
                 await sandbox.process.exec(f"mkdir -p {parent}")
             await sandbox.fs.upload_file(p.read_bytes(), dest)
