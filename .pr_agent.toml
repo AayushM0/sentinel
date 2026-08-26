@@ -1,0 +1,20 @@
+[pr_reviewer]
+# Qodo PR-Agent Reviewer Settings
+require_focused_review = true
+require_score_review = true
+extra_instructions = """
+You are reviewing for Sentinel — the PR Guardian & Architectural ADR Memory Agent.
+Enforce the following project conventions:
+1. Ensure all architectural decisions are documented in MADR format under docs/adr/ or referenced in tests.
+2. Verify all new modules have corresponding unit tests in tests/ (100% TDD compliance).
+3. Ensure no secrets, tokens, or local absolute paths are hardcoded.
+4. Ensure SQLite database transactions use WAL mode and proper timeout configurations.
+"""
+
+[pr_description]
+publish_labels = true
+use_bullet_points = true
+
+[config]
+model = "gpt-4o"
+fallback_models = ["claude-3-5-sonnet"]

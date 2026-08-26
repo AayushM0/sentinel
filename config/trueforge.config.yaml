@@ -1,0 +1,56 @@
+# TrueForge Harness & Approval Gate Configuration
+version: "1.0.0"
+agent:
+  name: "sentinel"
+  description: "PR Guardian & Architectural ADR Memory Agent"
+  harness: "trueforge"
+
+storage:
+  backend: "sqlite"
+  path: ".sentinel/session.db"
+  journal_mode: "WAL"
+  busy_timeout_ms: 5000
+
+approval_gate:
+  enabled: true
+  policies:
+    - action: "PRE_PUSH_COMMIT"
+      require_human_confirmation: true
+      render_target: "all" # terminal + chat_ui
+    - action: "LACE_ADR_UPDATE"
+      require_human_confirmation: true
+      render_target: "all"
+    - action: "PR_SUBMISSION"
+      require_human_confirmation: true
+      render_target: "all"
+
+gated_tools:
+  - name: "remember"
+    description: "Write or update an Architectural Decision Record in LACE vault"
+    approval_required: true
+  - name: "git_push"
+    description: "Push local commits to remote GitHub repository"
+    approval_required: true
+
+subagents:
+  sandbox_runner:
+    provider: "daytona"
+    default_test_cmd: "pytest tests/ -v"
+    default_lint_cmd: "ruff check ."
+    timeout_seconds: 30
+  adr_analyzer:
+    model: "claude-3-5-sonnet"
+    similarity_threshold: 0.75
+
+mcp_servers:
+  lace:
+    command: "python"
+    args:
+      - "-u"
+      - "-c"
+      - "import asyncio; from lace.mcp.server import run_server; asyncio.run(run_server())"
+    env:
+      PYTHONPATH: "D:/Projects/LACE/src"
+      PYTHONUNBUFFERED: "1"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
