@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "daytona>=0.10.0",
     "mcp>=2.1.0",
     "pydantic>=2.13.4",
     "pyyaml>=6.0.3",
