@@ -48,8 +48,9 @@ Sentinel implements MADR 3.0.0 (Markdown Any Architecture Decision Records). ADR
 Review lifecycles progress through deterministic states governed by strict transition rules:
 - `PENDING_SUBAGENTS`: Review session created, awaiting subagent evaluations.
 - `PENDING_HUMAN_APPROVAL`: Subagents completed, interactive card presented to human reviewer.
-- `APPROVED`: Human reviewer accepted changes; session is permanently sealed in terminal state.
-- `REJECTED`: Human reviewer rejected changes; session is permanently sealed in terminal state.
+- `APPROVED`: Human reviewer accepted changes; transitions session to `COMPLETED`.
+- `COMPLETED`: Review cycle successfully finished (terminal state).
+- `REJECTED`: Human reviewer rejected changes (terminal state).
 
 ### 3. Daytona Sandbox Execution
 Subagent A provisions an ephemeral Debian/Python 3.13 container on Daytona Cloud:
@@ -60,7 +61,7 @@ Subagent A provisions an ephemeral Debian/Python 3.13 container on Daytona Cloud
 - Executes bounded-retry cleanup teardowns to prevent cloud resource leaks.
 
 ### 4. Human-in-the-Loop Approval Gate
-Aggregates test outputs and LACE architectural delta reports into an interactive Markdown card. Enforces exact-token matching (`approve` / `reject`) and fail-closed security.
+Aggregates test outputs and LACE architectural delta reports into an interactive Markdown card. Accepts exact approval tokens (`approve`, `a`, `yes`, `y`) and enforces fail-closed security (all other inputs result in rejection).
 
 ---
 
@@ -151,9 +152,9 @@ uv run python scripts/live_daytona_test.py
 ## Quality and Compliance Invariants
 
 1. **Rule 2903681 (Testability):** All non-trivial modules contain self-checks in `if __name__ == "__main__":` utilizing native `assert` statements and in-memory test doubles.
-2. **Rule 2903657 (Trust Boundaries):** External data from MCP servers and CLI outputs must be validated through explicit Pydantic schemas before consumption.
-3. **Rule 2903630 (Standard Library APIs):** String interpolation into shell execution is prohibited; all dynamic arguments must use `shlex.quote()`.
-4. **Fail-Closed Gate Design:** Unrecognized or empty approval inputs default to rejection. Terminal states (`APPROVED`, `REJECTED`) are immutable.
+2. **Rule 2903657 (Trust Boundaries):** External payloads from MCP tools and structured domain schemas are validated through explicit Pydantic response models before consumption. Unstructured CLI outputs are safely parsed into typed data structures.
+3. **Rule 2903630 (Standard Library APIs):** Configured test and linter commands are passed as discrete executable strings, while dynamic/derived filesystem paths (such as directory targets) must strictly use `shlex.quote()` to prevent argument injection.
+4. **Fail-Closed Gate Design:** Unrecognized or empty approval inputs default to rejection. Terminal states (`COMPLETED`, `REJECTED`) are immutable once reached.
 5. **Path Containment:** File uploads canonicalize paths using `.resolve()` and enforce `is_relative_to()` to prevent symlink traversal and escapes.
 
 ---
