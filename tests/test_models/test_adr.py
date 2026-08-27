@@ -65,6 +65,16 @@ Discussion ongoing.
     adr_p = ADR.from_markdown(proposed_md)
     assert adr_p.status == "proposed"
 
+    draft_md = """---
+id: "ADR-097"
+title: "Draft Feature"
+status: "draft"
+---
+Initial draft.
+"""
+    adr_d = ADR.from_markdown(draft_md)
+    assert adr_d.status == "draft"
+
     rejected_md = """---
 id: "ADR-099"
 title: "Rejected Feature"

@@ -16,7 +16,9 @@ class ADR(BaseModel):
 
     id: str = ""
     title: str
-    status: Literal["proposed", "accepted", "rejected", "deprecated", "superseded"] = "accepted"
+    status: Literal["draft", "proposed", "accepted", "rejected", "deprecated", "superseded"] = (
+        "accepted"
+    )
     date: str = Field(default_factory=lambda: datetime.now(UTC).date().isoformat())
 
     superseded_by: str | None = None
@@ -65,10 +67,11 @@ class ADR(BaseModel):
 
 if __name__ == "__main__":
     # Framework-free self-check (Rule 2903681)
-    adr = ADR(id="ADR-001", title="Test Policy", status="accepted", body="Policy body.")
+    adr = ADR(id="ADR-001", title="Test Policy", status="draft", body="Policy body.")
     md = adr.to_markdown()
     reparsed = ADR.from_markdown(md)
     assert reparsed.id == "ADR-001"
     assert reparsed.title == "Test Policy"
+    assert reparsed.status == "draft"
     assert reparsed.body == "Policy body."
     print("adr.py standalone self-check passed successfully.")
