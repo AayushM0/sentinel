@@ -560,6 +560,12 @@ if __name__ == "__main__":
                 except ValueError:
                     pass
 
+                try:
+                    await adapter.run_sandbox(workspace_path=str(tmp_path), timeout_seconds=0)
+                    raise AssertionError("Should have rejected zero timeout")
+                except ValueError:
+                    pass
+
             asyncio.run(_async_self_tests())
 
         print("TrueForgeAdapter standalone self-check passed successfully.")
