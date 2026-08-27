@@ -451,7 +451,9 @@ class TrueForgeAdapter:
                 except Exception:  # noqa: BLE001
                     payload = {}
 
-            proposed_adrs = payload.get("proposed_adrs", [])
+            proposed_adrs = payload.get("proposed_adrs") or payload.get("delta_report", {}).get(
+                "proposed_adrs", []
+            )
             if proposed_adrs:
                 from sentinel.models.adr import ADR
 
