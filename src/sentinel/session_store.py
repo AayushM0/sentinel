@@ -57,7 +57,8 @@ class SessionStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    diff_summary TEXT NOT NULL
+                    diff_summary TEXT NOT NULL,
+                    raw_diff TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS subagent_tasks (
@@ -80,6 +81,15 @@ class SessionStore:
                 );
                 """
             )
+            # Schema migration check: ensure review_sessions has raw_diff column
+            sess_cols = [
+                r["name"] for r in conn.execute("PRAGMA table_info(review_sessions);").fetchall()
+            ]
+            if sess_cols and "raw_diff" not in sess_cols:
+                conn.execute(
+                    "ALTER TABLE review_sessions ADD COLUMN raw_diff TEXT NOT NULL DEFAULT '';"
+                )
+
             # Schema migration check: ensure subagent_tasks has composite primary key
             table_info = conn.execute("PRAGMA table_info(subagent_tasks);").fetchall()
             pk_cols = [r["name"] for r in table_info if r["pk"] > 0]
@@ -109,6 +119,7 @@ class SessionStore:
         commit_sha: str,
         diff_summary: str = "",
         session_id: str | None = None,
+        raw_diff: str = "",
     ) -> ReviewSession:
         """Create a new review session in initial PENDING_SUBAGENTS status."""
         sess_id = session_id or f"sess_{uuid.uuid4().hex[:8]}"
@@ -118,10 +129,10 @@ class SessionStore:
         with self._get_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO review_sessions (session_id, branch_name, commit_sha, created_at, updated_at, status, diff_summary)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO review_sessions (session_id, branch_name, commit_sha, created_at, updated_at, status, diff_summary, raw_diff)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (sess_id, branch_name, commit_sha, now, now, status.value, diff_summary),
+                (sess_id, branch_name, commit_sha, now, now, status.value, diff_summary, raw_diff),
             )
 
         return ReviewSession(
@@ -132,6 +143,7 @@ class SessionStore:
             updated_at=now,
             status=status,
             diff_summary=diff_summary,
+            raw_diff=raw_diff,
         )
 
     def save_subagent_result(
@@ -273,6 +285,7 @@ class SessionStore:
                 updated_at=sess_row["updated_at"],
                 status=SessionStatus(sess_row["status"]),
                 diff_summary=sess_row["diff_summary"],
+                raw_diff=sess_row["raw_diff"] if "raw_diff" in tuple(sess_row.keys()) else "",
                 tasks=tasks,
                 pending_approval=pending_appr,
             )
@@ -344,6 +357,57 @@ class SessionStore:
                 (SessionStatus.COMPLETED.value, now, session_id),
             )
 
+    def transition_session(
+        self, session_id: str, new_status: SessionStatus
+    ) -> ReviewSession | None:
+        """Explicitly transition a session to a new lifecycle status."""
+        now = datetime.now(UTC).isoformat()
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE review_sessions SET status = ?, updated_at = ? WHERE session_id = ?",
+                (new_status.value, now, session_id),
+            )
+        return self.get_session(session_id)
+
+    def list_sessions(self, limit: int = 20) -> list[ReviewSession]:
+        """List review sessions ordered by updated_at descending with bounded limit."""
+        bounded_limit = max(1, min(limit, 100))
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id, branch_name, commit_sha, created_at, updated_at, status, diff_summary, raw_diff
+                FROM review_sessions
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
+
+        sessions: list[ReviewSession] = []
+        for r in rows:
+            sess = self.get_session(r["session_id"])
+            if sess:
+                sessions.append(sess)
+        return sessions
+
+    def get_latest_pending_session(self) -> ReviewSession | None:
+        """Retrieve the most recent session awaiting human approval."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT session_id
+                FROM review_sessions
+                WHERE status = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (SessionStatus.PENDING_HUMAN_APPROVAL.value,),
+            ).fetchone()
+
+        if not row:
+            return None
+        return self.get_session(row["session_id"])
+
 
 if __name__ == "__main__":
     # Framework-free self-check (Rule 2903681)
@@ -352,8 +416,9 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmpdir:
         test_db = str(Path(tmpdir) / "test.db")
         store = SessionStore(db_path=test_db)
-        sess = store.create_session("main", "abc1234", "Diff test")
+        sess = store.create_session("main", "abc1234", "Diff test", raw_diff="diff content")
         assert sess.status == SessionStatus.PENDING_SUBAGENTS
+        assert sess.raw_diff == "diff content"
 
         task = store.save_subagent_result(
             sess.session_id, SubagentType.SANDBOX_RUNNER, SubagentStatus.COMPLETED, {"tests": 5}
@@ -364,6 +429,15 @@ if __name__ == "__main__":
             sess.session_id, ApprovalActionType.PRE_PUSH_COMMIT, {"card": "Test"}
         )
         assert appr.user_decision == ApprovalDecision.PENDING
+
+        # Verify get_latest_pending_session
+        pending = store.get_latest_pending_session()
+        assert pending is not None and pending.session_id == sess.session_id
+
+        # Verify list_sessions
+        session_list = store.list_sessions(limit=10)
+        assert len(session_list) == 1
+        assert session_list[0].session_id == sess.session_id
 
         store.resolve_approval(appr.approval_id, ApprovalDecision.APPROVED)
         hydrated = store.get_session(sess.session_id)
