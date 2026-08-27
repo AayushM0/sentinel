@@ -286,19 +286,16 @@ class ADRDeltaAnalyzer:
                         novel_packages.append(pkg)
 
         # Filter out packages already covered by existing ADRs
-        uncovered: list[str] = []
-        for pkg in novel_packages:
-            covered = False
-            for adr in active_adrs:
-                if (
-                    (adr.code_pattern and pkg in adr.code_pattern.lower())
-                    or (pkg in adr.title.lower())
-                    or (any(pkg in tag.lower() for tag in adr.tags))
-                ):
-                    covered = True
-                    break
-            if not covered:
-                uncovered.append(pkg)
+        uncovered = [
+            pkg
+            for pkg in novel_packages
+            if not any(
+                (adr.code_pattern and pkg in adr.code_pattern.lower())
+                or (pkg in adr.title.lower())
+                or (any(pkg in tag.lower() for tag in adr.tags))
+                for adr in active_adrs
+            )
+        ]
 
         if not uncovered:
             return []
