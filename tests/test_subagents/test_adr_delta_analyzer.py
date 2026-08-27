@@ -327,3 +327,151 @@ async def test_adr_delta_analyzer_approval_gate_integration(
 
     assert "Zero violations detected." in card
     assert "sess_gate" in card
+
+
+@pytest.mark.asyncio
+async def test_substring_collision_does_not_trigger_false_violation(
+    mock_lace_client: LaceMcpClient,
+) -> None:
+    """Word boundary matching must prevent substring collision (localStore vs localStorage)."""
+    diff = parse_git_diff(
+        "diff --git a/src/store.ts b/src/store.ts\n"
+        "--- a/src/store.ts\n"
+        "+++ b/src/store.ts\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+const localStore = new CustomStore();\n"
+    )
+    adr = ADR(
+        id="ADR-014",
+        title="Encrypted Store",
+        status="accepted",
+        code_pattern="localStorage",
+        body="Use SecureStore",
+    )
+    mock_lace_client.get_relevant_adrs = AsyncMock(return_value=[adr])
+
+    req = DeltaRequest(
+        session_id="sess_word_boundary",
+        git_diff=diff,
+        touched_files=["src/store.ts"],
+        lace_client=mock_lace_client,
+    )
+
+    analyzer = ADRDeltaAnalyzer()
+    report = await analyzer.run(req)
+
+    assert len(report.violations) == 0
+
+
+@pytest.mark.asyncio
+async def test_batch_multi_file_violations(
+    mock_lace_client: LaceMcpClient,
+) -> None:
+    """Analyzer must report multiple violations across multiple files without halting early."""
+    diff = parse_git_diff(
+        "diff --git a/src/auth.ts b/src/auth.ts\n"
+        "--- a/src/auth.ts\n"
+        "+++ b/src/auth.ts\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+window.localStorage.setItem('auth', token);\n"
+        "diff --git a/src/db.py b/src/db.py\n"
+        "--- a/src/db.py\n"
+        "+++ b/src/db.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+sqlite3.connect('raw.db')\n"
+    )
+    adr1 = ADR(
+        id="ADR-014",
+        title="Auth Encryption",
+        status="accepted",
+        code_pattern="localStorage.setItem",
+        body="Use SecureStore",
+    )
+    adr2 = ADR(
+        id="ADR-022",
+        title="Async DB Pool",
+        status="accepted",
+        code_pattern="sqlite3.connect",
+        body="Use AsyncSession",
+    )
+    mock_lace_client.get_relevant_adrs = AsyncMock(return_value=[adr1, adr2])
+
+    req = DeltaRequest(
+        session_id="sess_multi_viol",
+        git_diff=diff,
+        touched_files=["src/auth.ts", "src/db.py"],
+        lace_client=mock_lace_client,
+    )
+
+    analyzer = ADRDeltaAnalyzer()
+    report = await analyzer.run(req)
+
+    assert len(report.violations) == 2
+    paths_in_violations = [v for v in report.violations if "src/auth.ts" in v or "src/db.py" in v]
+    assert len(paths_in_violations) == 2
+
+
+@pytest.mark.asyncio
+async def test_query_context_extracts_imports_and_symbols(
+    mock_lace_client: LaceMcpClient,
+) -> None:
+    """_extract_query_context must extract imports and symbols from added lines."""
+    diff = parse_git_diff(
+        "diff --git a/src/cache/redis_mgr.py b/src/cache/redis_mgr.py\n"
+        "--- a/src/cache/redis_mgr.py\n"
+        "+++ b/src/cache/redis_mgr.py\n"
+        "@@ -1,2 +1,4 @@\n"
+        "+import redis\n"
+        "+from cryptography.fernet import Fernet\n"
+    )
+    req = DeltaRequest(
+        session_id="sess_imports",
+        git_diff=diff,
+        touched_files=["src/cache/redis_mgr.py"],
+        lace_client=mock_lace_client,
+    )
+
+    analyzer = ADRDeltaAnalyzer()
+    query = analyzer._extract_query_context(req)
+
+    assert "redis" in query
+    assert "cache" in query
+    assert "cryptography" in query or "fernet" in query.lower()
+
+
+@pytest.mark.asyncio
+async def test_multiline_block_comments_do_not_trigger_violations(
+    mock_lace_client: LaceMcpClient,
+) -> None:
+    """Block comments /* ... */ must not trigger constraint violations."""
+    diff = parse_git_diff(
+        "diff --git a/src/auth.ts b/src/auth.ts\n"
+        "--- a/src/auth.ts\n"
+        "+++ b/src/auth.ts\n"
+        "@@ -1,2 +1,5 @@\n"
+        "+/* \n"
+        "+ * Example migration:\n"
+        "+ * localStorage.setItem('token', val)\n"
+        "+ */\n"
+        "+const safeStore = new SecureStore();\n"
+    )
+    adr = ADR(
+        id="ADR-014",
+        title="Auth Encryption",
+        status="accepted",
+        code_pattern="localStorage.setItem",
+        body="Use SecureStore",
+    )
+    mock_lace_client.get_relevant_adrs = AsyncMock(return_value=[adr])
+
+    req = DeltaRequest(
+        session_id="sess_block_comment",
+        git_diff=diff,
+        touched_files=["src/auth.ts"],
+        lace_client=mock_lace_client,
+    )
+
+    analyzer = ADRDeltaAnalyzer()
+    report = await analyzer.run(req)
+
+    assert len(report.violations) == 0

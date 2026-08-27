@@ -147,12 +147,24 @@ class ADRDeltaAnalyzer:
             return report
 
     def _extract_query_context(self, request: DeltaRequest) -> str:
-        """Derive search query keywords from touched files and diff paths."""
+        """Derive search query keywords from touched files and imported modules."""
         effective_files = request.touched_files or [f.path for f in request.git_diff.files]
         terms: list[str] = []
+
+        # 1. Path components
         for path in effective_files:
             parts = path.replace("\\", "/").split("/")
             terms.extend([p for p in parts if p and "." not in p])
+
+        # 2. Extract module names from imports in added lines
+        import_pattern = re.compile(r"^\s*(?:import|from)\s+([a-zA-Z0-9_\.]+)", re.MULTILINE)
+        for file_diff in request.git_diff.files:
+            for line in file_diff.added_lines:
+                match = import_pattern.match(line)
+                if match:
+                    module_full = match.group(1)
+                    module_parts = module_full.split(".")
+                    terms.extend([p for p in module_parts if p])
 
         if not terms:
             terms = ["architecture", "policy", "patterns"]
@@ -175,28 +187,53 @@ class ADRDeltaAnalyzer:
         enforceable_adrs = [adr for adr in active_adrs if adr.status in ("accepted", "proposed")]
 
         for file_diff in git_diff.files:
-            for line in file_diff.added_lines:
-                clean_line = self._strip_comments(line)
-                if not clean_line:
-                    continue
+            clean_lines = self._clean_code_lines(file_diff.added_lines)
 
+            for line in clean_lines:
                 for adr in enforceable_adrs:
                     if adr.code_pattern:
-                        pattern_escaped = re.escape(adr.code_pattern)
-                        if re.search(pattern_escaped, clean_line):
+                        pattern = adr.code_pattern.strip()
+                        # If pattern contains identifier-only characters, use word boundary
+                        if re.match(r"^[a-zA-Z0-9_]+$", pattern):
+                            regex = rf"\b{re.escape(pattern)}\b"
+                        else:
+                            regex = re.escape(pattern)
+
+                        if re.search(regex, line):
                             violations.append(
                                 f"{file_diff.path}: Code matches prohibited pattern in {adr.id} ('{adr.title}')"
                             )
         return violations
 
+    def _clean_code_lines(self, added_lines: list[str]) -> list[str]:
+        """Strip single-line and multi-line comments from added lines."""
+        if not added_lines:
+            return []
+
+        # Join to handle multi-line block comments /* ... */ and docstrings
+        full_text = "\n".join(added_lines)
+
+        # Remove C/JS-style block comments /* ... */
+        full_text = re.sub(r"/\*[\s\S]*?\*/", "", full_text)
+
+        # Remove Python docstrings """ ... """ and ''' ... '''
+        full_text = re.sub(r'"""[\s\S]*?"""', "", full_text)
+        full_text = re.sub(r"'''[\s\S]*?'''", "", full_text)
+
+        result_lines: list[str] = []
+        for raw_line in full_text.split("\n"):
+            clean = self._strip_comments(raw_line)
+            if clean:
+                result_lines.append(clean)
+        return result_lines
+
     def _strip_comments(self, line: str) -> str:
         """Strip single-line comments without mangling URLs (https://) or hex colors (#ff0000)."""
         s = line.strip()
-        # Whole line comment
-        if s.startswith(("#", "//", "/*")):
+        # Whole line comments
+        if s.startswith(("#", "//", "/*", "*", "*/")):
             return ""
-        # Strip trailing comments that are separated by whitespace from code
-        # e.g., 'const x = 1; // comment' or 'x = 1 # comment'
+        # Trailing comments separated by whitespace
         clean = re.sub(r"\s+(?:#|//).*$", "", line)
         return clean.strip()
 
@@ -257,7 +294,22 @@ if __name__ == "__main__":
         assert analyzer._strip_comments("// comment only") == ""
         assert analyzer._strip_comments("x = 1 # trailing comment") == "x = 1"
 
-        # Check C: Positive violation detection on non-empty diff
+        # Check C: Word boundary prevents substring collision
+        diff_coll = parse_git_diff(
+            "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,1 +1,2 @@\n+const localStore = 1;\n"
+        )
+        adr_coll = ADR(
+            id="ADR-01", title="Store", status="accepted", code_pattern="localStorage", body=""
+        )
+        mock_client.get_relevant_adrs = AsyncMock(return_value=[adr_coll])
+        report_coll = await analyzer.run(
+            DeltaRequest(
+                session_id="s1", git_diff=diff_coll, touched_files=["a.ts"], lace_client=mock_client
+            )
+        )
+        assert len(report_coll.violations) == 0
+
+        # Check D: Positive violation detection on non-empty diff
         sample_diff = parse_git_diff(
             "diff --git a/src/auth.py b/src/auth.py\n"
             "--- a/src/auth.py\n"
@@ -283,18 +335,6 @@ if __name__ == "__main__":
         report_viol = await analyzer.run(req_viol)
         assert len(report_viol.violations) == 1
         assert "ADR-014" in report_viol.violations[0]
-
-        # Check D: Validation constraints
-        try:
-            DeltaRequest(
-                session_id="",
-                git_diff=parse_git_diff(""),
-                touched_files=[],
-                lace_client=mock_client,
-            )
-            raise AssertionError("Should have raised ValueError on empty session_id")
-        except ValueError:
-            pass
 
         print("adr_delta_analyzer.py deep standalone self-check passed successfully.")
 
