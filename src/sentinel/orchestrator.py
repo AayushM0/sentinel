@@ -21,6 +21,7 @@ if _src_dir not in sys.path:
 
 from sentinel.approval_gate import ApprovalGate
 from sentinel.mcp.lace_client import LaceMcpClient
+from sentinel.models.adr import ADR
 from sentinel.models.diff import GitDiff
 from sentinel.models.review_state import (
     ApprovalDecision,
@@ -83,9 +84,41 @@ class ReviewOrchestrator:
 
     async def run_review(self, request: OrchestratorRequest) -> ReviewSession:
         """Run subagents concurrently, prompt approval gate, and commit approved ADRs."""
-        # 1. Initialize session in store if needed
+        # 1. Inspect existing session state in store
         existing = request.session_store.get_session(request.session_id)
-        if existing is None:
+        if existing is not None:
+            # Short-circuit if session is already in a terminal state
+            if existing.status in (SessionStatus.COMPLETED, SessionStatus.REJECTED):
+                return existing
+
+            # If pending approval and subagent results exist, resume without rerunning subagents
+            if existing.status == SessionStatus.PENDING_HUMAN_APPROVAL and existing.tasks:
+                sb_task = next(
+                    (t for t in existing.tasks if t.subagent_type == SubagentType.SANDBOX_RUNNER),
+                    None,
+                )
+                adr_task = next(
+                    (
+                        t
+                        for t in existing.tasks
+                        if t.subagent_type == SubagentType.ADR_DELTA_ANALYZER
+                    ),
+                    None,
+                )
+                if sb_task and adr_task:
+                    test_result = sb_task.result_payload or {}
+                    delta_report = adr_task.result_payload or {}
+                    self.approval_gate.session_store = request.session_store
+                    decision = self.approval_gate.request_approval(
+                        session=existing,
+                        test_result=test_result,
+                        delta_report=delta_report,
+                        interactive=request.interactive,
+                    )
+                    return await self._handle_approval_decision(
+                        request, existing, decision, delta_report
+                    )
+        else:
             request.session_store.create_session(
                 session_id=request.session_id,
                 branch_name=request.branch_name,
@@ -141,16 +174,47 @@ class ReviewOrchestrator:
         )
 
         # 7. Apply human decision & post-approval side effects
+        return await self._handle_approval_decision(request, session, decision, adr_res)
+
+    async def _handle_approval_decision(
+        self,
+        request: OrchestratorRequest,
+        session: ReviewSession,
+        decision: ApprovalDecision,
+        adr_res: Any,
+    ) -> ReviewSession:
+        """Process approval outcome, commit proposed ADRs, and transition session lifecycle."""
         if decision == ApprovalDecision.APPROVED:
             session.status = SessionStatus.APPROVED
-            # Commit proposed ADRs to LACE persistent memory
-            if hasattr(adr_res, "proposed_adrs") and adr_res.proposed_adrs:
-                for proposed in adr_res.proposed_adrs:
+            all_committed = True
+
+            # Rehydrate proposed ADRs if present
+            proposed_list = getattr(adr_res, "proposed_adrs", None)
+            if not proposed_list and isinstance(adr_res, dict):
+                raw_proposed = adr_res.get("proposed_adrs", [])
+                proposed_list = [ADR(**p) if isinstance(p, dict) else p for p in raw_proposed]
+
+            if proposed_list:
+                for proposed in proposed_list:
                     try:
-                        await request.lace_client.commit_adr(adr=proposed)
-                        logger.info("Committed proposed ADR %s to LACE vault", proposed.id)
+                        success = await request.lace_client.commit_adr(adr=proposed)
+                        if not success:
+                            all_committed = False
+                            logger.error("LACE MCP rejected commit of ADR %s", proposed.id)
+                        else:
+                            logger.info("Committed proposed ADR %s to LACE vault", proposed.id)
                     except Exception as exc:  # noqa: BLE001
+                        all_committed = False
                         logger.error("Failed to commit ADR %s to LACE: %s", proposed.id, exc)
+
+            if all_committed:
+                request.session_store.mark_completed(request.session_id)
+                session.status = SessionStatus.COMPLETED
+            else:
+                logger.warning(
+                    "Session %s left in APPROVED state due to ADR commit failure",
+                    request.session_id,
+                )
 
         elif decision == ApprovalDecision.REJECTED:
             session.status = SessionStatus.REJECTED
@@ -160,23 +224,10 @@ class ReviewOrchestrator:
         return session
 
     async def _run_sandbox_safely(self, req: SandboxRequest, store: SessionStore) -> SandboxResult:
-        """Execute SandboxRunner with top-level error capture and guaranteed persistence."""
+        """Execute SandboxRunner with top-level error capture; single persistence owner."""
         self.sandbox_runner.session_store = store
         try:
-            res = await self.sandbox_runner.run(req)
-            # Ensure task result is recorded even if runner was mocked
-            status = (
-                SubagentStatus.COMPLETED
-                if res.exit_code == 0 and res.sandbox_status in ("completed", "success")
-                else SubagentStatus.FAILED
-            )
-            store.save_subagent_result(
-                session_id=req.session_id,
-                subagent_type=SubagentType.SANDBOX_RUNNER,
-                status=status,
-                result_payload=res.to_dict(),
-            )
-            return res
+            return await self.sandbox_runner.run(req)
         except Exception as exc:  # noqa: BLE001
             err_msg = f"SandboxRunner failed: {exc}"
             logger.error("%s\n%s", err_msg, traceback.format_exc())
@@ -185,6 +236,7 @@ class ReviewOrchestrator:
                 subagent_type=SubagentType.SANDBOX_RUNNER,
                 status=SubagentStatus.FAILED,
                 result_payload={"error": str(exc), "traceback": traceback.format_exc()},
+                task_id=f"{req.session_id}_sandbox",
             )
             return SandboxResult(
                 sandbox_status="crashed",
@@ -197,17 +249,9 @@ class ReviewOrchestrator:
             )
 
     async def _run_adr_safely(self, req: DeltaRequest, store: SessionStore) -> DeltaReport:
-        """Execute ADRDeltaAnalyzer with top-level error capture and guaranteed persistence."""
+        """Execute ADRDeltaAnalyzer with top-level error capture; single persistence owner."""
         try:
-            res = await self.adr_analyzer.run(req, session_store=store)
-            # Ensure task result is recorded even if analyzer was mocked
-            store.save_subagent_result(
-                session_id=req.session_id,
-                subagent_type=SubagentType.ADR_DELTA_ANALYZER,
-                status=SubagentStatus.COMPLETED,
-                result_payload=res.to_dict(),
-            )
-            return res
+            return await self.adr_analyzer.run(req, session_store=store)
         except Exception as exc:  # noqa: BLE001
             err_msg = f"ADRDeltaAnalyzer failed: {exc}"
             logger.error("%s\n%s", err_msg, traceback.format_exc())
@@ -216,6 +260,7 @@ class ReviewOrchestrator:
                 subagent_type=SubagentType.ADR_DELTA_ANALYZER,
                 status=SubagentStatus.FAILED,
                 result_payload={"error": str(exc), "traceback": traceback.format_exc()},
+                task_id=f"{req.session_id}_adr",
             )
             return DeltaReport(
                 session_id=req.session_id,

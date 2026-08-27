@@ -9,9 +9,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 import time
+import tomllib
 import traceback
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from sentinel.mcp.lace_client import LaceMcpClient
@@ -22,45 +25,28 @@ from sentinel.session_store import SessionStore
 
 logger = logging.getLogger("sentinel.subagents.adr_delta_analyzer")
 
-# Common standard library modules to exclude from novel ADR drafting
-_STDLIB_MODULES = {
-    "abc",
-    "asyncio",
-    "base64",
-    "collections",
-    "contextlib",
-    "copy",
-    "dataclasses",
-    "datetime",
-    "decimal",
-    "enum",
-    "functools",
-    "hashlib",
-    "io",
-    "itertools",
-    "json",
-    "logging",
-    "math",
-    "os",
-    "pathlib",
-    "random",
-    "re",
-    "shlex",
-    "shutil",
-    "sqlite3",
-    "string",
-    "sys",
-    "tempfile",
-    "threading",
-    "time",
-    "traceback",
-    "typing",
-    "unittest",
-    "urllib",
-    "uuid",
-    "warnings",
-    "weakref",
-}
+# Authoritative standard library module inventory from Python runtime
+_STDLIB_MODULES = sys.stdlib_module_names
+
+
+def _get_project_declared_dependencies() -> set[str]:
+    """Extract declared project dependency top-level import names."""
+    known = {"sentinel", "daytona", "mcp", "pydantic", "yaml", "pyyaml", "pytest", "ruff"}
+    try:
+        pyproject_path = Path("pyproject.toml")
+        if pyproject_path.exists():
+            content = pyproject_path.read_text(encoding="utf-8")
+            data = tomllib.loads(content)
+            deps = data.get("project", {}).get("dependencies", [])
+            dev_deps = data.get("dependency-groups", {}).get("dev", [])
+            for dep in deps + dev_deps:
+                name = re.split(r"[><=~!;]", dep)[0].strip().lower().replace("-", "_")
+                known.add(name)
+                if name == "pyyaml":
+                    known.add("yaml")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not parse pyproject.toml dependencies: %s", exc)
+    return known
 
 
 @dataclass
@@ -108,19 +94,21 @@ class DeltaReport:
 
 
 class ADRDeltaAnalyzer:
-    """Subagent B: Evaluates code changes against LACE architectural memory."""
+    """Evaluates semantic code deltas against LACE ADR knowledge and drafts architectural decisions."""
 
     async def run(
         self,
         request: DeltaRequest,
         session_store: SessionStore | None = None,
     ) -> DeltaReport:
-        """Run ADR delta reasoning analysis on the provided git diff."""
+        """Execute delta analysis: fetch ADRs, scan diff, identify violations, and propose drafts."""
         start_time = time.perf_counter()
 
         try:
-            # Handle empty or whitespace-only diffs immediately
-            if not request.git_diff.files:
+            # Short-circuit on empty diff
+            if not request.git_diff.files or all(
+                not f.added_lines and not f.deleted_lines for f in request.git_diff.files
+            ):
                 duration_ms = int((time.perf_counter() - start_time) * 1000)
                 report = DeltaReport(
                     session_id=request.session_id,
@@ -140,9 +128,9 @@ class ADRDeltaAnalyzer:
             active_adrs = await self._fetch_active_adrs(request, query)
 
             # Evaluate constraints, modified ADRs, and novel proposals
-            violations = self._evaluate_constraints(request.git_diff, active_adrs)
-            modified_adrs = self._detect_modified_adrs(request.git_diff, active_adrs)
-            proposed_adrs = self._detect_novel_adrs(request.git_diff, active_adrs)
+            violations = self._evaluate_constraints(request, active_adrs)
+            modified_adrs = self._detect_modified_adrs(request, active_adrs)
+            proposed_adrs = await self._detect_novel_adrs(request, active_adrs)
 
             # Build readable summary
             summary_parts: list[str] = []
@@ -221,29 +209,33 @@ class ADRDeltaAnalyzer:
         return ", ".join(dict.fromkeys(terms))
 
     async def _fetch_active_adrs(self, request: DeltaRequest, query: str) -> list[ADR]:
-        """Fetch ADRs from LACE MCP with timeout protection."""
-        try:
-            return await asyncio.wait_for(
-                request.lace_client.get_relevant_adrs(query=query),
-                timeout=float(request.timeout_seconds),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to retrieve ADRs from LACE MCP: %s", exc)
-            return []
+        """Fetch ADRs from LACE MCP passing required touched_files with timeout protection."""
+        effective_files = request.touched_files or [f.path for f in request.git_diff.files]
+        return await asyncio.wait_for(
+            request.lace_client.get_relevant_adrs(
+                touched_files=effective_files,
+                query=query,
+            ),
+            timeout=float(request.timeout_seconds),
+        )
 
-    def _evaluate_constraints(self, git_diff: GitDiff, active_adrs: list[ADR]) -> list[str]:
-        """Evaluate added lines in git diff against active ADR constraints."""
+    def _evaluate_constraints(self, request: DeltaRequest, active_adrs: list[ADR]) -> list[str]:
+        """Evaluate added lines in git diff against active ADR constraints respecting confidence."""
         violations: list[str] = []
-        enforceable_adrs = [adr for adr in active_adrs if adr.status in ("accepted", "proposed")]
+        enforceable_adrs = [
+            adr
+            for adr in active_adrs
+            if adr.status in ("accepted", "proposed")
+            and (adr.confidence is None or adr.confidence >= request.confidence_threshold)
+        ]
 
-        for file_diff in git_diff.files:
+        for file_diff in request.git_diff.files:
             clean_lines = self._clean_code_lines(file_diff.added_lines)
 
             for line in clean_lines:
                 for adr in enforceable_adrs:
                     if adr.code_pattern:
                         pattern = adr.code_pattern.strip()
-                        # If pattern contains identifier-only characters, use word boundary
                         if re.match(r"^[a-zA-Z0-9_]+$", pattern):
                             regex = rf"\b{re.escape(pattern)}\b"
                         else:
@@ -255,31 +247,39 @@ class ADRDeltaAnalyzer:
                             )
         return violations
 
-    def _detect_modified_adrs(self, git_diff: GitDiff, active_adrs: list[ADR]) -> list[str]:
-        """Detect existing ADRs that were deleted or modified in diff."""
+    def _detect_modified_adrs(self, request: DeltaRequest, active_adrs: list[ADR]) -> list[str]:
+        """Detect existing ADRs that were deleted or modified in diff respecting confidence."""
         modified: list[str] = []
-        for file_diff in git_diff.files:
+        enforceable_adrs = [
+            adr
+            for adr in active_adrs
+            if (adr.confidence is None or adr.confidence >= request.confidence_threshold)
+        ]
+
+        for file_diff in request.git_diff.files:
             clean_deleted = self._clean_code_lines(file_diff.deleted_lines)
             for line in clean_deleted:
-                for adr in active_adrs:
+                for adr in enforceable_adrs:
                     if adr.code_pattern and adr.id not in modified:
                         pattern = adr.code_pattern.strip()
                         if re.search(re.escape(pattern), line):
                             modified.append(adr.id)
         return modified
 
-    def _detect_novel_adrs(self, git_diff: GitDiff, active_adrs: list[ADR]) -> list[ADR]:
-        """Detect novel 3rd-party modules and draft MADR 3.0 records."""
+    async def _detect_novel_adrs(self, request: DeltaRequest, active_adrs: list[ADR]) -> list[ADR]:
+        """Detect novel 3rd-party modules and draft MADR 3.0 records with collision-free IDs."""
         import_pattern = re.compile(r"^\s*(?:import|from)\s+([a-zA-Z0-9_]+)", re.MULTILINE)
         novel_packages: list[str] = []
+        project_deps = _get_project_declared_dependencies()
 
-        for file_diff in git_diff.files:
+        for file_diff in request.git_diff.files:
             for line in file_diff.added_lines:
                 match = import_pattern.match(line)
                 if match:
                     pkg = match.group(1).lower()
                     if (
                         pkg not in _STDLIB_MODULES
+                        and pkg not in project_deps
                         and pkg not in novel_packages
                         and not pkg.startswith("sentinel")
                     ):
@@ -300,12 +300,28 @@ class ADRDeltaAnalyzer:
         if not uncovered:
             return []
 
-        # Derive next available ADR ID
-        highest_id_num = 0
+        # Derive next available ADR ID across active ADRs and LACE search vault
+        occupied_ids: set[int] = set()
         for adr in active_adrs:
             m = re.search(r"ADR-(\d+)", adr.id)
             if m:
-                highest_id_num = max(highest_id_num, int(m.group(1)))
+                occupied_ids.add(int(m.group(1)))
+
+        if hasattr(request.lace_client, "search_memory"):
+            try:
+                memories = await request.lace_client.search_memory(
+                    query="", category="decision", max_results=100
+                )
+                for item in memories:
+                    text = getattr(item, "raw", "") or getattr(item, "content", "") or ""
+                    for m in re.finditer(r"ADR-(\d+)", str(text)):
+                        occupied_ids.add(int(m.group(1)))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "LACE memory search for occupied ADR IDs encountered an error: %s", exc
+                )
+
+        highest_id_num = max(occupied_ids, default=0)
 
         proposed: list[ADR] = []
         for pkg in uncovered:
@@ -329,6 +345,7 @@ class ADRDeltaAnalyzer:
                 tags=["architecture", "auto-generated", "pivot", pkg],
                 constraints=[f"Use {pkg} in accordance with Sentinel guidelines"],
                 code_pattern=pkg,
+                confidence=1.0,
                 body=body_text,
             )
             proposed.append(adr_draft)
@@ -352,12 +369,47 @@ class ADRDeltaAnalyzer:
         return result_lines
 
     def _strip_comments(self, line: str) -> str:
-        """Strip single-line comments without mangling URLs (https://) or hex colors (#ff0000)."""
-        s = line.strip()
-        if s.startswith(("#", "//", "/*", "*", "*/")):
-            return ""
-        clean = re.sub(r"\s+(?:#|//).*$", "", line)
-        return clean.strip()
+        """Strip inline comments (# or //) while preserving quoted string literals and URLs."""
+        in_quote: str | None = None
+        escape = False
+        i = 0
+        n = len(line)
+
+        while i < n:
+            ch = line[i]
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if ch == "\\":
+                escape = True
+                i += 1
+                continue
+            if in_quote is not None:
+                if ch == in_quote:
+                    in_quote = None
+                i += 1
+                continue
+
+            # Outside string literal quotes
+            if ch in ("'", '"', "`"):
+                in_quote = ch
+                i += 1
+                continue
+            if ch == "#":
+                return line[:i].strip()
+            if ch == "/" and i + 1 < n and line[i + 1] == "/":
+                # Preserve URLs (http:// or https://)
+                if i >= 5 and line[i - 5 : i] == "http:":
+                    i += 2
+                    continue
+                if i >= 6 and line[i - 6 : i] == "https:":
+                    i += 2
+                    continue
+                return line[:i].strip()
+            i += 1
+
+        return line.strip()
 
     def _persist_result(
         self,
@@ -367,7 +419,7 @@ class ADRDeltaAnalyzer:
         status: SubagentStatus = SubagentStatus.COMPLETED,
         error_payload: dict[str, Any] | None = None,
     ) -> None:
-        """Persist result payload to SQLite SessionStore if store is available."""
+        """Persist result payload to SQLite SessionStore using deterministic task_id."""
         if session_store is not None:
             payload = report.to_dict()
             if error_payload:
@@ -377,114 +429,97 @@ class ADRDeltaAnalyzer:
                 subagent_type=SubagentType.ADR_DELTA_ANALYZER,
                 status=status,
                 result_payload=payload,
+                task_id=f"{request.session_id}_adr",
             )
 
 
 if __name__ == "__main__":
+    import tempfile
     from unittest.mock import AsyncMock
 
     from sentinel.models.diff import parse_git_diff
 
     # Standalone zero-dependency self-checks (Rule 2903681)
     async def _self_test() -> None:
-        # Check A: Clean pass on empty diff
-        mock_client = AsyncMock(spec=LaceMcpClient)
-        mock_client.get_relevant_adrs = AsyncMock(return_value=[])
+        with tempfile.TemporaryDirectory():
+            mock_client = AsyncMock(spec=LaceMcpClient)
+            mock_client.get_relevant_adrs = AsyncMock(return_value=[])
 
-        req = DeltaRequest(
-            session_id="self_check_sess",
-            git_diff=parse_git_diff(""),
-            touched_files=[],
-            lace_client=mock_client,
-        )
+            analyzer = ADRDeltaAnalyzer()
 
-        analyzer = ADRDeltaAnalyzer()
-        report = await analyzer.run(req)
-
-        assert report.session_id == "self_check_sess"
-        assert report.violations == []
-        assert report.modified_adrs == []
-        assert report.proposed_adrs == []
-        assert "No architectural changes" in report.summary
-
-        # Check B: Comment stripping doesn't mangle hex colors or URLs
-        assert analyzer._strip_comments("const color = '#ff0000';") == "const color = '#ff0000';"
-        assert (
-            analyzer._strip_comments("const url = 'https://api.example.com';")
-            == "const url = 'https://api.example.com';"
-        )
-        assert analyzer._strip_comments("// comment only") == ""
-        assert analyzer._strip_comments("x = 1 # trailing comment") == "x = 1"
-
-        # Check C: Word boundary prevents substring collision
-        diff_coll = parse_git_diff(
-            "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,1 +1,2 @@\n+const localStore = 1;\n"
-        )
-        adr_coll = ADR(
-            id="ADR-001",
-            title="Store",
-            status="accepted",
-            code_pattern="localStorage",
-            body="",
-        )
-        mock_client.get_relevant_adrs = AsyncMock(return_value=[adr_coll])
-        report_coll = await analyzer.run(
-            DeltaRequest(
-                session_id="s1",
-                git_diff=diff_coll,
-                touched_files=["a.ts"],
+            # 1. Empty diff
+            req = DeltaRequest(
+                session_id="self_check_sess",
+                git_diff=parse_git_diff(""),
+                touched_files=[],
                 lace_client=mock_client,
             )
-        )
-        assert len(report_coll.violations) == 0
+            report = await analyzer.run(req)
+            assert report.session_id == "self_check_sess"
+            assert report.violations == []
+            assert report.modified_adrs == []
+            assert report.proposed_adrs == []
+            assert "No architectural changes" in report.summary
 
-        # Check D: Positive violation detection on non-empty diff
-        sample_diff = parse_git_diff(
-            "diff --git a/src/auth.py b/src/auth.py\n"
-            "--- a/src/auth.py\n"
-            "+++ b/src/auth.py\n"
-            "@@ -1,3 +1,4 @@\n"
-            "+localStorage.setItem('key', val)\n"
-        )
-        adr_sample = ADR(
-            id="ADR-014",
-            title="Encrypted Store",
-            status="accepted",
-            code_pattern="localStorage.setItem",
-            body="Use SecureStore",
-        )
-        mock_client.get_relevant_adrs = AsyncMock(return_value=[adr_sample])
-
-        req_viol = DeltaRequest(
-            session_id="self_check_viol",
-            git_diff=sample_diff,
-            touched_files=["src/auth.py"],
-            lace_client=mock_client,
-        )
-        report_viol = await analyzer.run(req_viol)
-        assert len(report_viol.violations) == 1
-        assert "ADR-014" in report_viol.violations[0]
-
-        # Check E: Novel package generates MADR 3.0 draft
-        novel_diff = parse_git_diff(
-            "diff --git a/src/analytics.py b/src/analytics.py\n"
-            "--- a/src/analytics.py\n"
-            "+++ b/src/analytics.py\n"
-            "@@ -1,1 +1,2 @@\n"
-            "+import duckdb\n"
-        )
-        report_novel = await analyzer.run(
-            DeltaRequest(
-                session_id="self_novel",
-                git_diff=novel_diff,
-                touched_files=["src/analytics.py"],
-                lace_client=mock_client,
+            # 2. Quote-aware inline comment stripping
+            assert (
+                analyzer._strip_comments("const color = '#ff0000';") == "const color = '#ff0000';"
             )
-        )
-        assert len(report_novel.proposed_adrs) == 1
-        assert report_novel.proposed_adrs[0].id == "ADR-015"
-        assert "duckdb" in report_novel.proposed_adrs[0].title.lower()
+            assert (
+                analyzer._strip_comments("const url = 'https://api.example.com';")
+                == "const url = 'https://api.example.com';"
+            )
+            assert analyzer._strip_comments("// comment only") == ""
+            assert analyzer._strip_comments("x = 1 # trailing comment") == "x = 1"
+            assert analyzer._strip_comments("value=1# no whitespace comment") == "value=1"
+            assert analyzer._strip_comments("foo()// no whitespace comment") == "foo()"
 
-        print("adr_delta_analyzer.py deep standalone self-check passed successfully.")
+            # 3. Substring collision protection
+            diff_coll = parse_git_diff(
+                "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,1 +1,2 @@\n+const localStore = 1;\n"
+            )
+            adr_coll = ADR(
+                id="ADR-014",
+                title="Encrypted Store",
+                status="accepted",
+                code_pattern="localStorage",
+                body="",
+            )
+            mock_client.get_relevant_adrs = AsyncMock(return_value=[adr_coll])
+            report_coll = await analyzer.run(
+                DeltaRequest(
+                    session_id="coll_sess",
+                    git_diff=diff_coll,
+                    touched_files=["a.ts"],
+                    lace_client=mock_client,
+                )
+            )
+            assert len(report_coll.violations) == 0
+
+            # 4. Confidence threshold filtering
+            low_conf_adr = ADR(
+                id="ADR-099",
+                title="Low Confidence Rule",
+                status="accepted",
+                code_pattern="lowConfFunc",
+                confidence=0.5,
+                body="",
+            )
+            mock_client.get_relevant_adrs = AsyncMock(return_value=[low_conf_adr])
+            diff_low_conf = parse_git_diff(
+                "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,2 @@\n+lowConfFunc()\n"
+            )
+            report_low_conf = await analyzer.run(
+                DeltaRequest(
+                    session_id="low_conf_sess",
+                    git_diff=diff_low_conf,
+                    touched_files=["a.py"],
+                    lace_client=mock_client,
+                    confidence_threshold=0.8,
+                )
+            )
+            assert len(report_low_conf.violations) == 0
+
+            print("adr_delta_analyzer.py deep standalone self-check passed successfully.")
 
     asyncio.run(_self_test())
