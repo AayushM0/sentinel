@@ -10,7 +10,12 @@ Sentinel is an automated architectural guardrail and subagent verification syste
 flowchart TD
     subgraph Client ["Client / CI Execution"]
         PR["PR / Diff Input"]
-        CLI["Sentinel CLI / Runner"]
+        Orch["Review Orchestrator\n(orchestrator.py)"]
+    end
+
+    subgraph Subagents ["Parallel Subagents"]
+        Daytona["Subagent A: Daytona Sandbox Runner\n(subagents/sandbox_runner.py)"]
+        ADR["Subagent B: LACE ADR Delta Analyzer\n(subagents/adr_delta_analyzer.py)"]
     end
 
     subgraph Core ["Sentinel Core Engine"]
@@ -18,23 +23,21 @@ flowchart TD
         FSM["Review State Machine\n(models/review_state.py)"]
         Store["SQLite Session Store\n(session_store.py)"]
         Gate["Approval Gate Interceptor\n(approval_gate.py)"]
-    end
-
-    subgraph Integrations ["External Subsystems"]
         LACE["LACE MCP Client\n(mcp/lace_client.py)"]
-        Daytona["Daytona Sandbox Runner\n(subagents/sandbox_runner.py)"]
     end
 
     PR --> DiffParser
-    DiffParser --> CLI
-    CLI --> FSM
+    DiffParser --> Orch
+    Orch --> FSM
     FSM --> Store
-    CLI --> LACE
-    CLI --> Daytona
-    LACE --> Gate
+    Orch --> Daytona
+    Orch --> ADR
+    ADR --> LACE
     Daytona --> Gate
+    ADR --> Gate
     Gate --> Store
     Gate --> Decision["Human Approval Decision\n(APPROVED / REJECTED)"]
+    Decision -->|Approved| LACECommit["Commit Draft ADRs to LACE Vault"]
 ```
 
 ---
@@ -48,20 +51,27 @@ Sentinel implements MADR 3.0.0 (Markdown Any Architecture Decision Records). ADR
 Review lifecycles progress through deterministic states governed by strict transition rules:
 - `PENDING_SUBAGENTS`: Review session created, awaiting subagent evaluations.
 - `PENDING_HUMAN_APPROVAL`: Subagents completed, interactive card presented to human reviewer.
-- `APPROVED`: Human reviewer accepted changes; transitions session to `COMPLETED`.
+- `APPROVED`: Human reviewer accepted changes; triggers automatic ADR commitment to LACE and marks session `COMPLETED`.
 - `COMPLETED`: Review cycle successfully finished (terminal state).
 - `REJECTED`: Human reviewer rejected changes (terminal state).
 
-### 3. Daytona Sandbox Execution
-Subagent A provisions an ephemeral Debian/Python 3.13 container on Daytona Cloud:
+### 3. Subagent A: Daytona Sandbox Runner
+Provisions an ephemeral Debian/Python 3.13 container on Daytona Cloud:
 - Synchronizes full repository workspace context (fixtures, package manifests, documentation).
 - Runs dependency synchronization (`uv sync --dev`).
 - Runs optional linters with non-fatal isolation.
 - Runs authoritative test suites with automatic result parsing.
 - Executes bounded-retry cleanup teardowns to prevent cloud resource leaks.
 
-### 4. Human-in-the-Loop Approval Gate
-Aggregates test outputs and LACE architectural delta reports into an interactive Markdown card. Accepts exact approval tokens (`approve`, `a`, `yes`, `y`) and enforces fail-closed security (all other inputs result in rejection).
+### 4. Subagent B: ADR Delta Analyzer
+Queries historical ADRs from LACE memory and evaluates proposed git diffs:
+- Evaluates added lines against active ADR constraints and code patterns.
+- Enforces word-boundary matching and non-destructive comment stripping (preserving hex colors and URLs).
+- Tracks modified/superseded ADRs on pattern deletions.
+- Detects novel architectural packages (`duckdb`, `redis`, `grpc`) and auto-drafts MADR 3.0 records.
+
+### 5. Concurrent Review Orchestrator & Approval Gate
+`ReviewOrchestrator` runs Subagent A and Subagent B concurrently via `asyncio.gather()`, aggregates outputs into a rich Markdown approval card, accepts exact approval tokens (`approve`, `a`, `yes`, `y`), and enforces fail-closed security.
 
 ---
 
@@ -69,14 +79,16 @@ Aggregates test outputs and LACE architectural delta reports into an interactive
 
 | Path | Primary Responsibility |
 | :--- | :--- |
+| `src/sentinel/orchestrator.py` | Concurrent multi-subagent review coordinator and approval lifecycle orchestrator. |
+| `src/sentinel/subagents/adr_delta_analyzer.py` | Subagent B: LACE ADR delta reasoning analyzer, constraint scanner, and MADR 3.0 draft generator. |
+| `src/sentinel/subagents/sandbox_runner.py` | Subagent A: Daytona cloud sandbox runner with workspace synchronization and lifecycle safety guarantees. |
 | `src/sentinel/approval_gate.py` | Formats Markdown approval cards, processes interactive approval input, and records final audit decisions. |
 | `src/sentinel/session_store.py` | SQLite persistence layer with automatic schema migration (table rebuilds for composite keys). |
 | `src/sentinel/mcp/lace_client.py` | Async MCP client communicating with LACE memory servers; parses ADRs and tracks architectural context. |
 | `src/sentinel/mcp/types.py` | Pydantic response models enforcing strict trust boundary validation for external MCP payloads. |
 | `src/sentinel/models/adr.py` | MADR 3.0.0 parser and serializer handling YAML frontmatter and Markdown bodies. |
 | `src/sentinel/models/diff.py` | Unified git diff parser supporting Unicode octal escapes, diff header isolation, and whitespace preservation. |
-| `src/sentinel/models/review_state.py` | Domain enums and dataclasses (`ReviewSession`, `SubagentTask`, `ApprovalActionType`). |
-| `src/sentinel/subagents/sandbox_runner.py` | Daytona cloud sandbox runner subagent with workspace synchronization and lifecycle safety guarantees. |
+| `src/sentinel/models/review_state.py` | Domain enums and dataclasses (`ReviewSession`, `SubagentTask`, `ApprovalActionType`, `SessionStatus`). |
 | `scripts/live_daytona_test.py` | End-to-end integration script executing real cloud sandbox tests and the human approval gate. |
 
 ---
@@ -123,7 +135,10 @@ uv run pytest -v
 Sentinel modules include framework-free standalone test suites that can be executed directly without `pytest`:
 
 ```bash
+uv run python -m sentinel.orchestrator
+uv run python src/sentinel/subagents/adr_delta_analyzer.py
 uv run python src/sentinel/subagents/sandbox_runner.py
+uv run python src/sentinel/approval_gate.py
 uv run python src/sentinel/models/diff.py
 uv run python src/sentinel/models/adr.py
 ```
@@ -153,7 +168,7 @@ uv run python scripts/live_daytona_test.py
 
 1. **Rule 2903681 (Testability):** All non-trivial modules contain self-checks in `if __name__ == "__main__":` utilizing native `assert` statements and in-memory test doubles.
 2. **Rule 2903657 (Trust Boundaries):** External payloads from MCP tools and structured domain schemas are validated through explicit Pydantic response models before consumption. Unstructured CLI outputs are safely parsed into typed data structures.
-3. **Rule 2903630 (Standard Library APIs):** Configured test and linter commands are passed as discrete executable strings, while dynamic/derived filesystem paths (such as directory targets) must strictly use `shlex.quote()` to prevent argument injection.
+3. **Rule 2903630 (Standard Library APIs):** Configured test and linter commands are passed as discrete executable strings, while dynamic/derived filesystem paths strictly use `shlex.quote()` to prevent argument injection.
 4. **Fail-Closed Gate Design:** Unrecognized or empty approval inputs default to rejection. Terminal states (`COMPLETED`, `REJECTED`) are immutable once reached.
 5. **Path Containment:** File uploads canonicalize paths using `.resolve()` and enforce `is_relative_to()` to prevent symlink traversal and escapes.
 

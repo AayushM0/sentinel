@@ -239,6 +239,7 @@ if __name__ == "__main__":
             mock_client.get_relevant_adrs = AsyncMock(return_value=[])
             mock_client.commit_adr = AsyncMock(return_value=True)
 
+            # 1. Non-interactive pending approval flow
             req = OrchestratorRequest(
                 session_id="self_orch_sess",
                 branch_name="main",
@@ -256,6 +257,23 @@ if __name__ == "__main__":
             session = await orch.run_review(req)
             assert session.session_id == "self_orch_sess"
             assert session.status == SessionStatus.PENDING_HUMAN_APPROVAL
+
+            # 2. Validation constraints
+            try:
+                OrchestratorRequest(
+                    session_id="",
+                    branch_name="main",
+                    commit_sha="abcdef1",
+                    diff_summary="empty",
+                    git_diff=parse_git_diff(""),
+                    touched_files=[],
+                    workspace_root=tmp_path,
+                    lace_client=mock_client,
+                    session_store=store,
+                )
+                raise AssertionError("Should have raised ValueError on empty session_id")
+            except ValueError:
+                pass
 
             print("ReviewOrchestrator standalone self-check passed successfully.")
 
