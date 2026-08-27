@@ -67,7 +67,7 @@ def test_get_tool_definitions() -> None:
 
 
 def test_resolve_approval_through_adapter(tmp_path: Path) -> None:
-    """Resolves pending approval gate through TrueForgeAdapter."""
+    """Resolves pending approval gate through TrueForgeAdapter and completes workflow."""
     db_path = str(tmp_path / "test_session.db")
     store = SessionStore(db_path=db_path)
     sess = store.create_session("feat/test", "commit123", "Test diff")
@@ -86,7 +86,15 @@ def test_resolve_approval_through_adapter(tmp_path: Path) -> None:
 
     hydrated = store.get_session(sess.session_id)
     assert hydrated is not None
-    assert hydrated.status == SessionStatus.APPROVED
+    assert hydrated.status == SessionStatus.COMPLETED
+
+    # Resolving already decided approval raises ValueError
+    with pytest.raises(ValueError, match="already been decided"):
+        adapter.resolve_approval(appr.approval_id, ApprovalDecision.REJECTED, db_path=db_path)
+
+    # Missing approval ID raises ValueError
+    with pytest.raises(ValueError, match="not found"):
+        adapter.resolve_approval("missing_id", ApprovalDecision.APPROVED, db_path=db_path)
 
 
 @pytest.mark.asyncio
@@ -125,15 +133,20 @@ async def test_check_diff_through_adapter(tmp_path: Path) -> None:
         mock_review.return_value = mock_session
 
         adapter = TrueForgeAdapter()
-        res = await adapter.check_diff(
-            workspace_path=str(tmp_path),
-            store=store,
-        )
+        res = await adapter.check_diff(workspace_path=str(tmp_path), store=store)
 
         assert res["session_id"] == "sess_adapter_test"
         assert res["status"] == "COMPLETED"
         assert len(res["tasks"]) == 1
         assert res["tasks"][0]["subagent_type"] == "SANDBOX_RUNNER"
+
+
+@pytest.mark.asyncio
+async def test_check_diff_invalid_mode_raises(tmp_path: Path) -> None:
+    """check_diff rejects invalid diff mode."""
+    adapter = TrueForgeAdapter()
+    with pytest.raises(ValueError, match="Invalid diff extraction mode"):
+        await adapter.check_diff(workspace_path=str(tmp_path), mode="invalid")  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -143,7 +156,6 @@ async def test_query_adrs_through_adapter() -> None:
         id="ADR-001",
         title="Use Encrypted Storage",
         status="accepted",
-        decision="accept",
         context="Security requirement",
         consequences="Better security",
         code_pattern="use_encrypted_store()",
@@ -151,6 +163,7 @@ async def test_query_adrs_through_adapter() -> None:
     )
 
     mock_lace = AsyncMock(spec=LaceMcpClient)
+    mock_lace.is_connected = True
     mock_lace.get_relevant_adrs = AsyncMock(return_value=[mock_adr])
 
     adapter = TrueForgeAdapter()
@@ -188,3 +201,11 @@ async def test_run_sandbox_through_adapter(tmp_path: Path) -> None:
         assert res["sandbox_status"] == "completed"
         assert res["exit_code"] == 0
         assert res["tests_passed"] == 5
+
+
+@pytest.mark.asyncio
+async def test_run_sandbox_zero_timeout_raises(tmp_path: Path) -> None:
+    """run_sandbox does not bypass non-positive timeout validation."""
+    adapter = TrueForgeAdapter()
+    with pytest.raises(ValueError, match="timeout_seconds must be > 0"):
+        await adapter.run_sandbox(workspace_path=str(tmp_path), timeout_seconds=0)

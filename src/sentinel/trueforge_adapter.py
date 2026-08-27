@@ -60,6 +60,21 @@ class GatedTool(BaseModel):
     approval_required: bool = True
 
 
+def _default_gated_tools() -> list[GatedTool]:
+    return [
+        GatedTool(
+            name="remember",
+            description="Write or update an Architectural Decision Record in LACE vault",
+            approval_required=True,
+        ),
+        GatedTool(
+            name="git_push",
+            description="Push local commits to remote GitHub repository",
+            approval_required=True,
+        ),
+    ]
+
+
 class SubagentSandboxConfig(BaseModel):
     provider: str = "daytona"
     default_test_cmd: str = "pytest tests/ -v"
@@ -88,7 +103,7 @@ class TrueForgeConfig(BaseModel):
     agent: AgentMetadata = Field(default_factory=AgentMetadata)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     approval_gate: ApprovalGateConfig = Field(default_factory=ApprovalGateConfig)
-    gated_tools: list[GatedTool] = Field(default_factory=list)
+    gated_tools: list[GatedTool] = Field(default_factory=_default_gated_tools)
     subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
     mcp_servers: dict[str, McpServerConfig] = Field(default_factory=dict)
 
@@ -114,16 +129,30 @@ class TrueForgeAdapter:
         return Path("config/trueforge.config.yaml").resolve()
 
     def _load_config(self) -> TrueForgeConfig:
-        """Load and parse TrueForge configuration file with fallback defaults."""
+        """Load and parse TrueForge configuration file, failing closed on malformed configs."""
         if self.config_path.is_file():
             try:
                 raw_text = self.config_path.read_text(encoding="utf-8")
                 parsed = yaml.safe_load(raw_text)
                 if isinstance(parsed, dict):
                     return TrueForgeConfig.model_validate(parsed)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to parse TrueForge config at %s: %s", self.config_path, exc)
+                raise ValueError(f"Config at {self.config_path} must be a YAML dictionary")
+            except Exception as exc:
+                raise ValueError(
+                    f"Invalid TrueForge configuration at {self.config_path}: {exc}"
+                ) from exc
         return TrueForgeConfig()
+
+    def _get_lace_client(self) -> LaceMcpClient:
+        """Instantiate LaceMcpClient using configured MCP server parameters."""
+        lace_cfg = self.config.mcp_servers.get("lace")
+        if lace_cfg:
+            return LaceMcpClient(
+                server_command=lace_cfg.command,
+                server_args=lace_cfg.args,
+                server_env=lace_cfg.env,
+            )
+        return LaceMcpClient()
 
     def is_tool_gated(self, tool_name: str) -> bool:
         """Check if a tool requires approval before execution."""
@@ -252,11 +281,17 @@ class TrueForgeAdapter:
         store: SessionStore | None = None,
     ) -> dict[str, Any]:
         """Execute full architectural and sandbox check through Sentinel orchestrator."""
+        valid_modes = ("unstaged", "staged", "branch", "working_tree")
+        if mode not in valid_modes:
+            raise ValueError(
+                f"Invalid diff extraction mode '{mode}'. Must be one of {valid_modes}."
+            )
+
         ws_root = Path(workspace_path).resolve()
         git_ctx = extract_git_context(ws_root, mode=mode, base_branch=base_branch)
 
         session_store = store or SessionStore(db_path=self.config.storage.path)
-        client = lace_client or LaceMcpClient()
+        client = lace_client or self._get_lace_client()
         git_diff = parse_git_diff(git_ctx.raw_diff)
 
         diff_summary = f"Branch '{git_ctx.branch_name}' (mode: {mode}) touching {len(git_ctx.touched_files)} file(s)"
@@ -316,9 +351,14 @@ class TrueForgeAdapter:
         query: str = "",
         lace_client: LaceMcpClient | None = None,
     ) -> list[dict[str, Any]]:
-        """Query LACE ADR context directly."""
-        client = lace_client or LaceMcpClient()
-        adrs = await client.get_relevant_adrs(touched_files=touched_files, query=query)
+        """Query LACE ADR context directly with active connection management."""
+        client = lace_client or self._get_lace_client()
+        if not client.is_connected:
+            async with client:
+                adrs = await client.get_relevant_adrs(touched_files=touched_files, query=query)
+        else:
+            adrs = await client.get_relevant_adrs(touched_files=touched_files, query=query)
+
         return [
             {
                 "title": adr.title,
@@ -340,13 +380,18 @@ class TrueForgeAdapter:
     ) -> dict[str, Any]:
         """Execute tests in Daytona sandbox."""
         ws_root = Path(workspace_path).resolve()
+        timeout = (
+            self.config.subagents.sandbox_runner.timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         req = SandboxRequest(
             session_id="tf_sandbox_test",
             project_root=str(ws_root),
             changed_files=[],
             test_command=test_cmd or self.config.subagents.sandbox_runner.default_test_cmd,
             linter_command=lint_cmd or self.config.subagents.sandbox_runner.default_lint_cmd,
-            timeout_seconds=timeout_seconds or self.config.subagents.sandbox_runner.timeout_seconds,
+            timeout_seconds=timeout,
         )
         runner = SandboxRunner()
         res = await runner.run(req)
@@ -366,16 +411,40 @@ class TrueForgeAdapter:
         decision: str | ApprovalDecision,
         db_path: str | None = None,
     ) -> dict[str, Any]:
-        """Resolve pending approval in session store."""
+        """Resolve pending approval in session store and complete workflow."""
         store = SessionStore(db_path=db_path or self.config.storage.path)
+        with store._get_connection() as conn:
+            appr_row = conn.execute(
+                "SELECT session_id, user_decision, payload FROM pending_approvals WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+
+        if not appr_row:
+            raise ValueError(f"Pending approval '{approval_id}' not found in database.")
+        if appr_row["user_decision"] != ApprovalDecision.PENDING.value:
+            raise ValueError(
+                f"Pending approval '{approval_id}' has already been decided as '{appr_row['user_decision']}'."
+            )
+
         dec = ApprovalDecision(decision) if isinstance(decision, str) else decision
         store.resolve_approval(approval_id, dec)
-        return {"approval_id": approval_id, "status": "resolved", "decision": dec.value}
+
+        if dec == ApprovalDecision.APPROVED:
+            store.mark_completed(appr_row["session_id"])
+
+        return {
+            "approval_id": approval_id,
+            "status": "resolved",
+            "decision": dec.value,
+            "session_id": appr_row["session_id"],
+        }
 
 
 if __name__ == "__main__":
     # Standalone zero-dependency self-checks (Rule 2903681)
+    import asyncio
     import tempfile
+    from unittest.mock import AsyncMock
 
     def _self_test() -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -408,7 +477,33 @@ if __name__ == "__main__":
             )
             assert res["status"] == "resolved"
             hydrated = store.get_session(sess.session_id)
-            assert hydrated is not None and hydrated.status == SessionStatus.APPROVED
+            assert hydrated is not None and hydrated.status == SessionStatus.COMPLETED
+
+            # 4. Verify invalid approval resolution raises ValueError
+            try:
+                adapter.resolve_approval(
+                    "nonexistent_id", ApprovalDecision.APPROVED, db_path=db_path
+                )
+                raise AssertionError("Should have raised ValueError on missing approval ID")
+            except ValueError:
+                pass
+
+            # 5. Async tool checks with mock client
+            async def _async_checks() -> None:
+                mock_lace = AsyncMock(spec=LaceMcpClient)
+                mock_lace.is_connected = True
+                mock_lace.get_relevant_adrs = AsyncMock(return_value=[])
+
+                adrs = await adapter.query_adrs(touched_files=["test.py"], lace_client=mock_lace)
+                assert isinstance(adrs, list)
+
+                try:
+                    await adapter.check_diff(workspace_path=str(tmp_path), mode="invalid_mode")  # type: ignore[arg-type]
+                    raise AssertionError("Should have rejected invalid mode")
+                except ValueError:
+                    pass
+
+            asyncio.run(_async_checks())
 
         print("TrueForgeAdapter standalone self-check passed successfully.")
 
