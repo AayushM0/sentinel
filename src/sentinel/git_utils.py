@@ -82,6 +82,29 @@ def get_head_commit_sha(repo_path: Path) -> str:
         return "0000000000000000000000000000000000000000"
 
 
+def _synthesize_untracked_diff(repo_path: Path, rel_path: str) -> str:
+    """Generate synthetic unified diff for an untracked file."""
+    full_path = repo_path / rel_path
+    if not full_path.is_file():
+        return ""
+    try:
+        content = full_path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeError):
+        return ""
+
+    lines = content.splitlines()
+    num_lines = len(lines)
+    header = (
+        f"diff --git a/{rel_path} b/{rel_path}\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        f"+++ b/{rel_path}\n"
+        f"@@ -0,0 +1,{max(num_lines, 1)} @@\n"
+    )
+    body = "\n".join(f"+{line}" for line in lines) + ("\n" if lines else "+\n")
+    return header + body
+
+
 def extract_git_context(
     repo_path: Path,
     mode: Literal["unstaged", "staged", "branch", "working_tree"] = "unstaged",
@@ -98,36 +121,39 @@ def extract_git_context(
     if mode == "staged":
         diff_args = ["diff", "--cached"]
     elif mode == "branch":
-        # Check if base branch exists, otherwise fall back to origin/{base_branch}
         diff_args = ["diff", f"{base_branch}...HEAD"]
-    else:  # unstaged or working_tree
+    elif mode == "working_tree":
         diff_args = ["diff", "HEAD"]
+    else:  # unstaged
+        diff_args = ["diff"]
 
     try:
         raw_diff = _run_git(diff_args, cwd=repo_path)
     except GitError:
         if mode == "branch":
-            # Fallback if three-dot diff fails
             raw_diff = _run_git(["diff", base_branch], cwd=repo_path)
         else:
             raw_diff = _run_git(["diff"], cwd=repo_path)
 
-    # Check status for dirty state and touched files
     status_out = _run_git(["status", "--porcelain"], cwd=repo_path)
     is_dirty = bool(status_out.strip())
 
-    # Extract touched file paths from git diff headers and porcelain status
+    # In unstaged and working_tree modes, include untracked files in the diff
+    if mode in ("unstaged", "working_tree"):
+        untracked_diffs = []
+        for line in status_out.splitlines():
+            if line.startswith("?? "):
+                untracked_rel = line[3:].strip().strip('"')
+                diff_chunk = _synthesize_untracked_diff(repo_path, untracked_rel)
+                if diff_chunk:
+                    untracked_diffs.append(diff_chunk)
+        if untracked_diffs:
+            if raw_diff and not raw_diff.endswith("\n"):
+                raw_diff += "\n"
+            raw_diff += "".join(untracked_diffs)
+
+    # Extract touched file paths strictly from the resulting raw_diff
     touched_set: set[str] = set()
-
-    for line in status_out.splitlines():
-        if line.strip():
-            # Porcelain format: XY path or XY "path"
-            path_part = line[3:].strip().strip('"')
-            if " -> " in path_part:
-                path_part = path_part.split(" -> ")[1].strip('"')
-            if path_part:
-                touched_set.add(path_part)
-
     for line in raw_diff.splitlines():
         if line.startswith(("+++ b/", "--- a/")):
             path = line[6:].strip()

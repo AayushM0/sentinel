@@ -59,6 +59,7 @@ class ReviewSession(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     status: SessionStatus = SessionStatus.PENDING_SUBAGENTS
     diff_summary: str = ""
+    raw_diff: str = ""
     tasks: list[SubagentTask] = Field(default_factory=list)
     pending_approval: PendingApproval | None = None
 

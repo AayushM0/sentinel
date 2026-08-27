@@ -70,10 +70,16 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     session_id = f"sess_{uuid.uuid4().hex[:8]}"
     store = SessionStore(db_path=args.db_path)
+    diff_summary = f"Branch '{git_ctx.branch_name}' (mode: {mode}) touching {len(git_ctx.touched_files)} file(s)"
+    store.create_session(
+        session_id=session_id,
+        branch_name=git_ctx.branch_name,
+        commit_sha=git_ctx.commit_sha,
+        diff_summary=diff_summary,
+        raw_diff=git_ctx.raw_diff,
+    )
     lace_client = _get_lace_client(workspace_root)
     git_diff = parse_git_diff(git_ctx.raw_diff)
-
-    diff_summary = f"Branch '{git_ctx.branch_name}' (mode: {mode}) touching {len(git_ctx.touched_files)} file(s)"
 
     req = OrchestratorRequest(
         session_id=session_id,
@@ -129,14 +135,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
         print(f"Error: Review session '{session_id}' not found in database.", file=sys.stderr)
         return 2
 
-    if session.status in (SessionStatus.COMPLETED, SessionStatus.REJECTED):
+    if session.status in (SessionStatus.COMPLETED, SessionStatus.APPROVED, SessionStatus.REJECTED):
         print(
             f"Sentinel: Review session '{session_id}' is already in terminal status '{session.status.value}'."
         )
-        return 0 if session.status == SessionStatus.COMPLETED else 1
+        return 0 if session.status in (SessionStatus.COMPLETED, SessionStatus.APPROVED) else 1
 
     lace_client = _get_lace_client(workspace_root)
-    git_diff = parse_git_diff("")
+    git_diff = parse_git_diff(session.raw_diff)
+    touched = [f.path for f in git_diff.files]
 
     req = OrchestratorRequest(
         session_id=session.session_id,
@@ -144,7 +151,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         commit_sha=session.commit_sha,
         diff_summary=session.diff_summary,
         git_diff=git_diff,
-        touched_files=[],
+        touched_files=touched,
         workspace_root=workspace_root,
         lace_client=lace_client,
         session_store=store,
@@ -171,8 +178,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 def cmd_list(args: argparse.Namespace) -> int:
     """List recent review sessions and their outcomes from SQLite."""
+    bounded_limit = max(1, min(args.limit, 100))
     store = SessionStore(db_path=args.db_path)
-    sessions = store.list_sessions(limit=args.limit)
+    sessions = store.list_sessions(limit=bounded_limit)
 
     if not sessions:
         print("Sentinel: No review sessions found in database.")
@@ -382,8 +390,31 @@ if __name__ == "__main__":
     # Standalone zero-dependency self-checks (Rule 2903681)
     def _self_test() -> None:
         parser = build_parser()
-        args = parser.parse_args(["check", "--help"])
-        assert args is not None
+
+        # 1. Parse check with flags
+        args_check = parser.parse_args(
+            ["check", "--staged", "--non-interactive", "--timeout", "30"]
+        )
+        assert args_check.subcommand == "check"
+        assert args_check.staged is True
+        assert args_check.non_interactive is True
+        assert args_check.timeout == 30
+
+        # 2. Parse resume
+        args_resume = parser.parse_args(["resume", "sess_test_123", "--timeout", "45"])
+        assert args_resume.subcommand == "resume"
+        assert args_resume.session_id == "sess_test_123"
+        assert args_resume.timeout == 45
+
+        # 3. Parse list
+        args_list = parser.parse_args(["list", "--limit", "15"])
+        assert args_list.subcommand == "list"
+        assert args_list.limit == 15
+
+        # 4. Parse install-hook / uninstall-hook
+        args_inst = parser.parse_args(["install-hook", "--workspace", "."])
+        assert args_inst.subcommand == "install-hook"
+
         print("cli.py standalone self-check passed successfully.")
 
     if len(sys.argv) > 1 and sys.argv[1] == "--self-test":

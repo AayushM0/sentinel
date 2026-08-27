@@ -14,6 +14,11 @@ _PRE_PUSH_HOOK_TEMPLATE = """#!/bin/sh
 # Sentinel Pre-Push Architectural Guardrail Hook
 # Automatically installed by `sentinel install-hook`
 
+# Redirect stdin from terminal if available to prevent git ref data from poisoning input()
+if [ -t 0 ] || [ -e /dev/tty ]; then
+    exec < /dev/tty 2>/dev/null
+fi
+
 echo "Sentinel: Running pre-push architectural check on branch..."
 sentinel check --branch || {
     echo "Sentinel: Push aborted due to architectural violations, failed sandbox tests, or human rejection." >&2
@@ -26,16 +31,35 @@ class HookError(Exception):
     """Raised when git hook installation or removal fails."""
 
 
+def get_hooks_dir(repo_path: Path) -> Path:
+    """Resolve the authoritative git hooks directory using git rev-parse --git-path hooks."""
+    from sentinel.git_utils import _run_git
+
+    out = _run_git(["rev-parse", "--git-path", "hooks"], cwd=repo_path).strip()
+    p = Path(out)
+    if not p.is_absolute():
+        p = repo_path / p
+    return p.resolve()
+
+
 def install_pre_push_hook(repo_path: Path) -> Path:
-    """Install executable pre-push hook in the git repository."""
+    """Install executable pre-push hook in the git repository, preserving non-Sentinel hooks."""
     workspace = repo_path.resolve()
     if not is_git_repository(workspace):
         raise HookError(f"Not a git repository: {workspace}")
 
-    hooks_dir = workspace / ".git" / "hooks"
+    hooks_dir = get_hooks_dir(workspace)
     hooks_dir.mkdir(parents=True, exist_ok=True)
 
     hook_file = hooks_dir / "pre-push"
+    if hook_file.exists():
+        content = hook_file.read_text(encoding="utf-8")
+        if "# Sentinel Pre-Push Architectural Guardrail Hook" not in content:
+            # Backup original hook
+            backup_file = hooks_dir / "pre-push.sentinel-backup"
+            backup_file.write_text(content, encoding="utf-8")
+            logger.info("Preserved existing pre-push hook to %s", backup_file)
+
     hook_file.write_text(_PRE_PUSH_HOOK_TEMPLATE, encoding="utf-8")
 
     # Set executable permissions (0o755)
@@ -49,13 +73,27 @@ def install_pre_push_hook(repo_path: Path) -> Path:
 
 
 def uninstall_pre_push_hook(repo_path: Path) -> bool:
-    """Remove pre-push hook from git repository."""
+    """Remove pre-push hook from git repository if owned by Sentinel and restore backup if present."""
     workspace = repo_path.resolve()
-    hook_file = workspace / ".git" / "hooks" / "pre-push"
+    if not is_git_repository(workspace):
+        raise HookError(f"Not a git repository: {workspace}")
+
+    hooks_dir = get_hooks_dir(workspace)
+    hook_file = hooks_dir / "pre-push"
 
     if hook_file.exists():
+        content = hook_file.read_text(encoding="utf-8")
+        if "# Sentinel Pre-Push Architectural Guardrail Hook" not in content:
+            logger.warning("Refusing to uninstall non-Sentinel pre-push hook at %s", hook_file)
+            return False
+
         try:
             hook_file.unlink()
+            # Restore backup if available
+            backup_file = hooks_dir / "pre-push.sentinel-backup"
+            if backup_file.exists():
+                backup_file.rename(hook_file)
+                logger.info("Restored original pre-push hook from backup %s", backup_file)
             return True
         except Exception as exc:
             raise HookError(f"Failed to remove hook at {hook_file}: {exc}") from exc
