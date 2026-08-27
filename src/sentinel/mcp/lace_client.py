@@ -71,6 +71,11 @@ class LaceMcpClient:
         self._session: ClientSession | None = None
         self._is_connected: bool = False
 
+    @property
+    def is_connected(self) -> bool:
+        """Return whether client has an active MCP session."""
+        return self._is_connected and self._session is not None
+
     async def connect(self) -> None:
         """Establish stdio MCP connection to LACE server with leak-proof cleanup on failure."""
         if self._is_connected and self._session is not None:

@@ -66,7 +66,8 @@ def test_get_tool_definitions() -> None:
         assert d["parameters"]["type"] == "object"
 
 
-def test_resolve_approval_through_adapter(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_resolve_approval_through_adapter(tmp_path: Path) -> None:
     """Resolves pending approval gate through TrueForgeAdapter and completes workflow."""
     db_path = str(tmp_path / "test_session.db")
     store = SessionStore(db_path=db_path)
@@ -79,7 +80,9 @@ def test_resolve_approval_through_adapter(tmp_path: Path) -> None:
     )
 
     adapter = TrueForgeAdapter()
-    res = adapter.resolve_approval(appr.approval_id, ApprovalDecision.APPROVED, db_path=db_path)
+    res = await adapter.resolve_approval(
+        appr.approval_id, ApprovalDecision.APPROVED, db_path=db_path
+    )
 
     assert res["status"] == "resolved"
     assert res["decision"] == "APPROVED"
@@ -90,11 +93,11 @@ def test_resolve_approval_through_adapter(tmp_path: Path) -> None:
 
     # Resolving already decided approval raises ValueError
     with pytest.raises(ValueError, match="already been decided"):
-        adapter.resolve_approval(appr.approval_id, ApprovalDecision.REJECTED, db_path=db_path)
+        await adapter.resolve_approval(appr.approval_id, ApprovalDecision.REJECTED, db_path=db_path)
 
     # Missing approval ID raises ValueError
     with pytest.raises(ValueError, match="not found"):
-        adapter.resolve_approval("missing_id", ApprovalDecision.APPROVED, db_path=db_path)
+        await adapter.resolve_approval("missing_id", ApprovalDecision.APPROVED, db_path=db_path)
 
 
 @pytest.mark.asyncio
@@ -132,8 +135,13 @@ async def test_check_diff_through_adapter(tmp_path: Path) -> None:
         mock_git.return_value.touched_files = []
         mock_review.return_value = mock_session
 
+        mock_lace = AsyncMock(spec=LaceMcpClient)
+        mock_lace.is_connected = True
+
         adapter = TrueForgeAdapter()
-        res = await adapter.check_diff(workspace_path=str(tmp_path), store=store)
+        res = await adapter.check_diff(
+            workspace_path=str(tmp_path), store=store, lace_client=mock_lace
+        )
 
         assert res["session_id"] == "sess_adapter_test"
         assert res["status"] == "COMPLETED"

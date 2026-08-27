@@ -317,7 +317,18 @@ class TrueForgeAdapter:
         )
 
         orchestrator = ReviewOrchestrator()
-        result_session = await orchestrator.run_review(req)
+        try:
+            if not client.is_connected:
+                async with client:
+                    result_session = await orchestrator.run_review(req)
+            else:
+                result_session = await orchestrator.run_review(req)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "LACE MCP connection failed during check_diff: %s. Proceeding with fault-isolated review.",
+                exc,
+            )
+            result_session = await orchestrator.run_review(req)
 
         return {
             "session_id": result_session.session_id,
@@ -405,13 +416,14 @@ class TrueForgeAdapter:
             "logs": res.logs,
         }
 
-    def resolve_approval(
+    async def resolve_approval(
         self,
         approval_id: str,
         decision: str | ApprovalDecision,
         db_path: str | None = None,
+        lace_client: LaceMcpClient | None = None,
     ) -> dict[str, Any]:
-        """Resolve pending approval in session store and complete workflow."""
+        """Resolve pending approval in session store, commit approved ADRs, and complete workflow."""
         store = SessionStore(db_path=db_path or self.config.storage.path)
         with store._get_connection() as conn:
             appr_row = conn.execute(
@@ -430,6 +442,30 @@ class TrueForgeAdapter:
         store.resolve_approval(approval_id, dec)
 
         if dec == ApprovalDecision.APPROVED:
+            payload = appr_row["payload"] or {}
+            if isinstance(payload, str):
+                import json
+
+                try:
+                    payload = json.loads(payload)
+                except Exception:  # noqa: BLE001
+                    payload = {}
+
+            proposed_adrs = payload.get("proposed_adrs", [])
+            if proposed_adrs:
+                from sentinel.models.adr import ADR
+
+                client = lace_client or self._get_lace_client()
+                if not client.is_connected:
+                    async with client:
+                        for p in proposed_adrs:
+                            adr_obj = ADR(**p) if isinstance(p, dict) else p
+                            await client.commit_adr(adr_obj)
+                else:
+                    for p in proposed_adrs:
+                        adr_obj = ADR(**p) if isinstance(p, dict) else p
+                        await client.commit_adr(adr_obj)
+
             store.mark_completed(appr_row["session_id"])
 
         return {
@@ -444,7 +480,22 @@ if __name__ == "__main__":
     # Standalone zero-dependency self-checks (Rule 2903681)
     import asyncio
     import tempfile
-    from unittest.mock import AsyncMock
+
+    class _DummyLaceClient:
+        def __init__(self) -> None:
+            self.is_connected = True
+
+        async def get_relevant_adrs(self, touched_files: list[str], query: str = "") -> list[Any]:
+            return []
+
+        async def commit_adr(self, adr: Any) -> bool:
+            return True
+
+        async def __aenter__(self) -> _DummyLaceClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            pass
 
     def _self_test() -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -472,38 +523,44 @@ if __name__ == "__main__":
                 sess.session_id, ApprovalActionType.PRE_PUSH_COMMIT, {"card": "test"}
             )
 
-            res = adapter.resolve_approval(
-                appr.approval_id, ApprovalDecision.APPROVED, db_path=db_path
-            )
-            assert res["status"] == "resolved"
-            hydrated = store.get_session(sess.session_id)
-            assert hydrated is not None and hydrated.status == SessionStatus.COMPLETED
-
-            # 4. Verify invalid approval resolution raises ValueError
-            try:
-                adapter.resolve_approval(
-                    "nonexistent_id", ApprovalDecision.APPROVED, db_path=db_path
+            async def _async_self_tests() -> None:
+                dummy_client = _DummyLaceClient()  # type: ignore[assignment]
+                res = await adapter.resolve_approval(
+                    appr.approval_id,
+                    ApprovalDecision.APPROVED,
+                    db_path=db_path,
+                    lace_client=dummy_client,  # type: ignore[arg-type]
                 )
-                raise AssertionError("Should have raised ValueError on missing approval ID")
-            except ValueError:
-                pass
+                assert res["status"] == "resolved"
+                hydrated = store.get_session(sess.session_id)
+                assert hydrated is not None and hydrated.status == SessionStatus.COMPLETED
 
-            # 5. Async tool checks with mock client
-            async def _async_checks() -> None:
-                mock_lace = AsyncMock(spec=LaceMcpClient)
-                mock_lace.is_connected = True
-                mock_lace.get_relevant_adrs = AsyncMock(return_value=[])
+                # 4. Verify invalid approval resolution raises ValueError
+                try:
+                    await adapter.resolve_approval(
+                        "nonexistent_id", ApprovalDecision.APPROVED, db_path=db_path
+                    )
+                    raise AssertionError("Should have raised ValueError on missing approval ID")
+                except ValueError:
+                    pass
 
-                adrs = await adapter.query_adrs(touched_files=["test.py"], lace_client=mock_lace)
+                # 5. Async tool checks with dummy client
+                adrs = await adapter.query_adrs(
+                    touched_files=["test.py"],
+                    lace_client=dummy_client,  # type: ignore[arg-type]
+                )
                 assert isinstance(adrs, list)
 
                 try:
-                    await adapter.check_diff(workspace_path=str(tmp_path), mode="invalid_mode")  # type: ignore[arg-type]
+                    await adapter.check_diff(
+                        workspace_path=str(tmp_path),
+                        mode="invalid_mode",  # type: ignore[arg-type]
+                    )
                     raise AssertionError("Should have rejected invalid mode")
                 except ValueError:
                     pass
 
-            asyncio.run(_async_checks())
+            asyncio.run(_async_self_tests())
 
         print("TrueForgeAdapter standalone self-check passed successfully.")
 
