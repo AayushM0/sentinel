@@ -206,7 +206,8 @@ async def test_adr_delta_analyzer_ignores_deleted_lines(
     report = await analyzer.run(req)
 
     assert len(report.violations) == 0
-    assert "No architectural changes" in report.summary
+    assert "ADR-014" in report.modified_adrs
+    assert "modified/superseded" in report.summary
 
 
 @pytest.mark.asyncio
@@ -475,3 +476,122 @@ async def test_multiline_block_comments_do_not_trigger_violations(
     report = await analyzer.run(req)
 
     assert len(report.violations) == 0
+
+
+@pytest.mark.asyncio
+async def test_detect_modified_adr_when_replacement_pattern_introduced(
+    mock_lace_client: LaceMcpClient,
+) -> None:
+    """Replacing or deleting an existing ADR pattern must flag the ADR in modified_adrs."""
+    diff = parse_git_diff(
+        "diff --git a/src/auth.py b/src/auth.py\n"
+        "--- a/src/auth.py\n"
+        "+++ b/src/auth.py\n"
+        "@@ -1,4 +1,3 @@\n"
+        "-localStorage.setItem('key', val)\n"
+        "+SecureStore.setItem('key', val)\n"
+    )
+    adr = ADR(
+        id="ADR-014",
+        title="Encrypted Store",
+        status="accepted",
+        code_pattern="localStorage.setItem",
+        body="Use SecureStore",
+    )
+    mock_lace_client.get_relevant_adrs = AsyncMock(return_value=[adr])
+
+    req = DeltaRequest(
+        session_id="sess_mod_adr",
+        git_diff=diff,
+        touched_files=["src/auth.py"],
+        lace_client=mock_lace_client,
+    )
+
+    analyzer = ADRDeltaAnalyzer()
+    report = await analyzer.run(req)
+
+    assert "ADR-014" in report.modified_adrs
+    assert len(report.violations) == 0
+
+
+@pytest.mark.asyncio
+async def test_detect_architectural_pivot_and_draft_madr_adr(
+    mock_lace_client: LaceMcpClient,
+) -> None:
+    """Introducing a novel architectural package (e.g. duckdb) must propose a new MADR 3.0 draft."""
+    diff = parse_git_diff(
+        "diff --git a/src/analytics/engine.py b/src/analytics/engine.py\n"
+        "--- a/src/analytics/engine.py\n"
+        "+++ b/src/analytics/engine.py\n"
+        "@@ -1,2 +1,4 @@\n"
+        "+import duckdb\n"
+        "+con = duckdb.connect('warehouse.duckdb')\n"
+    )
+    existing_adr = ADR(
+        id="ADR-004",
+        title="SQLite Baseline",
+        status="accepted",
+        code_pattern="sqlite3",
+        body="Use SQLite",
+    )
+    mock_lace_client.get_relevant_adrs = AsyncMock(return_value=[existing_adr])
+
+    req = DeltaRequest(
+        session_id="sess_novel_pivot",
+        git_diff=diff,
+        touched_files=["src/analytics/engine.py"],
+        lace_client=mock_lace_client,
+    )
+
+    analyzer = ADRDeltaAnalyzer()
+    report = await analyzer.run(req)
+
+    assert len(report.proposed_adrs) == 1
+    proposed = report.proposed_adrs[0]
+    assert proposed.id == "ADR-005"
+    assert "duckdb" in proposed.title.lower()
+    assert proposed.status == "draft"
+    assert "duckdb" in proposed.tags
+    assert "duckdb" in proposed.code_pattern
+    assert "Context and Problem Statement" in proposed.body
+
+    # Verify MADR 3.0 roundtrip
+    md = proposed.to_markdown()
+    roundtrip = ADR.from_markdown(md)
+    assert roundtrip.id == proposed.id
+    assert roundtrip.title == proposed.title
+
+
+@pytest.mark.asyncio
+async def test_known_patterns_do_not_trigger_redundant_proposed_adrs(
+    mock_lace_client: LaceMcpClient,
+) -> None:
+    """Known packages covered by existing ADRs must NOT generate duplicate proposals."""
+    diff = parse_git_diff(
+        "diff --git a/src/db.py b/src/db.py\n"
+        "--- a/src/db.py\n"
+        "+++ b/src/db.py\n"
+        "@@ -1,2 +1,4 @@\n"
+        "+import sqlite3\n"
+        "+db = sqlite3.connect('app.db')\n"
+    )
+    existing_adr = ADR(
+        id="ADR-004",
+        title="SQLite Standard",
+        status="accepted",
+        code_pattern="sqlite3",
+        body="Use SQLite",
+    )
+    mock_lace_client.get_relevant_adrs = AsyncMock(return_value=[existing_adr])
+
+    req = DeltaRequest(
+        session_id="sess_known_pattern",
+        git_diff=diff,
+        touched_files=["src/db.py"],
+        lace_client=mock_lace_client,
+    )
+
+    analyzer = ADRDeltaAnalyzer()
+    report = await analyzer.run(req)
+
+    assert len(report.proposed_adrs) == 0

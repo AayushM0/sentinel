@@ -22,6 +22,46 @@ from sentinel.session_store import SessionStore
 
 logger = logging.getLogger("sentinel.subagents.adr_delta_analyzer")
 
+# Common standard library modules to exclude from novel ADR drafting
+_STDLIB_MODULES = {
+    "abc",
+    "asyncio",
+    "base64",
+    "collections",
+    "contextlib",
+    "copy",
+    "dataclasses",
+    "datetime",
+    "decimal",
+    "enum",
+    "functools",
+    "hashlib",
+    "io",
+    "itertools",
+    "json",
+    "logging",
+    "math",
+    "os",
+    "pathlib",
+    "random",
+    "re",
+    "shlex",
+    "shutil",
+    "sqlite3",
+    "string",
+    "sys",
+    "tempfile",
+    "threading",
+    "time",
+    "traceback",
+    "typing",
+    "unittest",
+    "urllib",
+    "uuid",
+    "warnings",
+    "weakref",
+}
+
 
 @dataclass
 class DeltaRequest:
@@ -99,17 +139,27 @@ class ADRDeltaAnalyzer:
             query = self._extract_query_context(request)
             active_adrs = await self._fetch_active_adrs(request, query)
 
-            # Evaluate constraints and detect deltas
+            # Evaluate constraints, modified ADRs, and novel proposals
             violations = self._evaluate_constraints(request.git_diff, active_adrs)
-            modified_adrs: list[str] = []
-            proposed_adrs: list[ADR] = []
+            modified_adrs = self._detect_modified_adrs(request.git_diff, active_adrs)
+            proposed_adrs = self._detect_novel_adrs(request.git_diff, active_adrs)
 
-            summary = (
-                f"{len(violations)} architectural violation(s) detected."
-                if violations
-                else "No architectural changes or violations detected."
-            )
+            # Build readable summary
+            summary_parts: list[str] = []
+            if violations:
+                summary_parts.append(f"{len(violations)} architectural violation(s) detected.")
+            if modified_adrs:
+                summary_parts.append(
+                    f"{len(modified_adrs)} existing ADR(s) modified/superseded ({', '.join(modified_adrs)})."
+                )
+            if proposed_adrs:
+                summary_parts.append(
+                    f"{len(proposed_adrs)} new ADR draft(s) proposed ({', '.join(a.id for a in proposed_adrs)})."
+                )
+            if not summary_parts:
+                summary_parts.append("No architectural changes or violations detected.")
 
+            summary = " ".join(summary_parts)
             duration_ms = int((time.perf_counter() - start_time) * 1000)
             report = DeltaReport(
                 session_id=request.session_id,
@@ -205,18 +255,95 @@ class ADRDeltaAnalyzer:
                             )
         return violations
 
-    def _clean_code_lines(self, added_lines: list[str]) -> list[str]:
-        """Strip single-line and multi-line comments from added lines."""
-        if not added_lines:
+    def _detect_modified_adrs(self, git_diff: GitDiff, active_adrs: list[ADR]) -> list[str]:
+        """Detect existing ADRs that were deleted or modified in diff."""
+        modified: list[str] = []
+        for file_diff in git_diff.files:
+            clean_deleted = self._clean_code_lines(file_diff.deleted_lines)
+            for line in clean_deleted:
+                for adr in active_adrs:
+                    if adr.code_pattern and adr.id not in modified:
+                        pattern = adr.code_pattern.strip()
+                        if re.search(re.escape(pattern), line):
+                            modified.append(adr.id)
+        return modified
+
+    def _detect_novel_adrs(self, git_diff: GitDiff, active_adrs: list[ADR]) -> list[ADR]:
+        """Detect novel 3rd-party modules and draft MADR 3.0 records."""
+        import_pattern = re.compile(r"^\s*(?:import|from)\s+([a-zA-Z0-9_]+)", re.MULTILINE)
+        novel_packages: list[str] = []
+
+        for file_diff in git_diff.files:
+            for line in file_diff.added_lines:
+                match = import_pattern.match(line)
+                if match:
+                    pkg = match.group(1).lower()
+                    if (
+                        pkg not in _STDLIB_MODULES
+                        and pkg not in novel_packages
+                        and not pkg.startswith("sentinel")
+                    ):
+                        novel_packages.append(pkg)
+
+        # Filter out packages already covered by existing ADRs
+        uncovered: list[str] = []
+        for pkg in novel_packages:
+            covered = False
+            for adr in active_adrs:
+                if (
+                    (adr.code_pattern and pkg in adr.code_pattern.lower())
+                    or (pkg in adr.title.lower())
+                    or (any(pkg in tag.lower() for tag in adr.tags))
+                ):
+                    covered = True
+                    break
+            if not covered:
+                uncovered.append(pkg)
+
+        if not uncovered:
             return []
 
-        # Join to handle multi-line block comments /* ... */ and docstrings
-        full_text = "\n".join(added_lines)
+        # Derive next available ADR ID
+        highest_id_num = 0
+        for adr in active_adrs:
+            m = re.search(r"ADR-(\d+)", adr.id)
+            if m:
+                highest_id_num = max(highest_id_num, int(m.group(1)))
 
-        # Remove C/JS-style block comments /* ... */
+        proposed: list[ADR] = []
+        for pkg in uncovered:
+            highest_id_num += 1
+            new_id = f"ADR-{highest_id_num:03d}"
+            body_text = (
+                f"## Context and Problem Statement\n\n"
+                f"The codebase introduces `{pkg}` for project capabilities.\n\n"
+                f"## Decision Outcome\n\n"
+                f"Chosen option: `{pkg}`, because it provides required architectural functionality.\n\n"
+                f"### Positive Consequences\n\n"
+                f"- Standardized integration for {pkg}\n\n"
+                f"### Negative Consequences\n\n"
+                f"- Additional dependency maintenance"
+            )
+            adr_draft = ADR(
+                id=new_id,
+                title=f"Adopt {pkg} for Architectural Infrastructure",
+                status="draft",
+                category="architecture",
+                tags=["architecture", "auto-generated", "pivot", pkg],
+                constraints=[f"Use {pkg} in accordance with Sentinel guidelines"],
+                code_pattern=pkg,
+                body=body_text,
+            )
+            proposed.append(adr_draft)
+        return proposed
+
+    def _clean_code_lines(self, lines: list[str]) -> list[str]:
+        """Strip single-line and multi-line comments from added/deleted lines."""
+        if not lines:
+            return []
+
+        full_text = "\n".join(lines)
         full_text = re.sub(r"/\*[\s\S]*?\*/", "", full_text)
-
-        # Remove Python docstrings """ ... """ and ''' ... '''
         full_text = re.sub(r'"""[\s\S]*?"""', "", full_text)
         full_text = re.sub(r"'''[\s\S]*?'''", "", full_text)
 
@@ -230,10 +357,8 @@ class ADRDeltaAnalyzer:
     def _strip_comments(self, line: str) -> str:
         """Strip single-line comments without mangling URLs (https://) or hex colors (#ff0000)."""
         s = line.strip()
-        # Whole line comments
         if s.startswith(("#", "//", "/*", "*", "*/")):
             return ""
-        # Trailing comments separated by whitespace
         clean = re.sub(r"\s+(?:#|//).*$", "", line)
         return clean.strip()
 
@@ -299,12 +424,19 @@ if __name__ == "__main__":
             "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,1 +1,2 @@\n+const localStore = 1;\n"
         )
         adr_coll = ADR(
-            id="ADR-01", title="Store", status="accepted", code_pattern="localStorage", body=""
+            id="ADR-001",
+            title="Store",
+            status="accepted",
+            code_pattern="localStorage",
+            body="",
         )
         mock_client.get_relevant_adrs = AsyncMock(return_value=[adr_coll])
         report_coll = await analyzer.run(
             DeltaRequest(
-                session_id="s1", git_diff=diff_coll, touched_files=["a.ts"], lace_client=mock_client
+                session_id="s1",
+                git_diff=diff_coll,
+                touched_files=["a.ts"],
+                lace_client=mock_client,
             )
         )
         assert len(report_coll.violations) == 0
@@ -335,6 +467,26 @@ if __name__ == "__main__":
         report_viol = await analyzer.run(req_viol)
         assert len(report_viol.violations) == 1
         assert "ADR-014" in report_viol.violations[0]
+
+        # Check E: Novel package generates MADR 3.0 draft
+        novel_diff = parse_git_diff(
+            "diff --git a/src/analytics.py b/src/analytics.py\n"
+            "--- a/src/analytics.py\n"
+            "+++ b/src/analytics.py\n"
+            "@@ -1,1 +1,2 @@\n"
+            "+import duckdb\n"
+        )
+        report_novel = await analyzer.run(
+            DeltaRequest(
+                session_id="self_novel",
+                git_diff=novel_diff,
+                touched_files=["src/analytics.py"],
+                lace_client=mock_client,
+            )
+        )
+        assert len(report_novel.proposed_adrs) == 1
+        assert report_novel.proposed_adrs[0].id == "ADR-015"
+        assert "duckdb" in report_novel.proposed_adrs[0].title.lower()
 
         print("adr_delta_analyzer.py deep standalone self-check passed successfully.")
 
