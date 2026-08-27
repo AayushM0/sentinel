@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 # Ensure src is on sys.path and script_dir does not shadow installed packages
 _script_dir = str(Path(__file__).resolve().parent)
@@ -491,7 +491,7 @@ if __name__ == "__main__":
         async def commit_adr(self, adr: Any) -> bool:
             return True
 
-        async def __aenter__(self) -> _DummyLaceClient:
+        async def __aenter__(self) -> Self:
             return self
 
         async def __aexit__(self, *args: object) -> None:
