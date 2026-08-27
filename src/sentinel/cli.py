@@ -189,6 +189,37 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_install_hook(args: argparse.Namespace) -> int:
+    """Install pre-push git hook into repository."""
+    from sentinel.hooks import HookError, install_pre_push_hook
+
+    workspace_root = Path(args.workspace).resolve()
+    try:
+        hook_path = install_pre_push_hook(workspace_root)
+        print(f"Sentinel: pre-push hook installed successfully at {hook_path}")
+        return 0
+    except HookError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+
+def cmd_uninstall_hook(args: argparse.Namespace) -> int:
+    """Remove pre-push git hook from repository."""
+    from sentinel.hooks import HookError, uninstall_pre_push_hook
+
+    workspace_root = Path(args.workspace).resolve()
+    try:
+        removed = uninstall_pre_push_hook(workspace_root)
+        if removed:
+            print("Sentinel: pre-push hook removed successfully.")
+        else:
+            print("Sentinel: No pre-push hook found to remove.")
+        return 0
+    except HookError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct command-line argument parser for Sentinel."""
     parser = argparse.ArgumentParser(
@@ -297,6 +328,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of sessions to display (default: 20)",
     )
 
+    # install-hook command
+    install_parser = subparsers.add_parser(
+        "install-hook",
+        help="Install Sentinel pre-push git hook into current repository",
+    )
+    install_parser.add_argument(
+        "--workspace",
+        "-w",
+        default=".",
+        help="Path to workspace root directory (default: current directory)",
+    )
+
+    # uninstall-hook command
+    uninstall_parser = subparsers.add_parser(
+        "uninstall-hook",
+        help="Remove Sentinel pre-push git hook from current repository",
+    )
+    uninstall_parser.add_argument(
+        "--workspace",
+        "-w",
+        default=".",
+        help="Path to workspace root directory (default: current directory)",
+    )
+
     return parser
 
 
@@ -315,6 +370,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_resume(args)
     elif args.subcommand == "list":
         return cmd_list(args)
+    elif args.subcommand == "install-hook":
+        return cmd_install_hook(args)
+    elif args.subcommand == "uninstall-hook":
+        return cmd_uninstall_hook(args)
 
     return 0
 
