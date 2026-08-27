@@ -111,6 +111,84 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Resume a review session from SQLite storage."""
+    workspace_root = Path(args.workspace).resolve()
+    store = SessionStore(db_path=args.db_path)
+
+    session_id = args.session_id
+    if not session_id:
+        latest = store.get_latest_pending_session()
+        if not latest:
+            print("Sentinel: No pending review sessions found to resume.")
+            return 0
+        session_id = latest.session_id
+
+    session = store.get_session(session_id)
+    if not session:
+        print(f"Error: Review session '{session_id}' not found in database.", file=sys.stderr)
+        return 2
+
+    if session.status in (SessionStatus.COMPLETED, SessionStatus.REJECTED):
+        print(
+            f"Sentinel: Review session '{session_id}' is already in terminal status '{session.status.value}'."
+        )
+        return 0 if session.status == SessionStatus.COMPLETED else 1
+
+    lace_client = _get_lace_client(workspace_root)
+    git_diff = parse_git_diff("")
+
+    req = OrchestratorRequest(
+        session_id=session.session_id,
+        branch_name=session.branch_name,
+        commit_sha=session.commit_sha,
+        diff_summary=session.diff_summary,
+        git_diff=git_diff,
+        touched_files=[],
+        workspace_root=workspace_root,
+        lace_client=lace_client,
+        session_store=store,
+        interactive=True,
+        timeout_seconds=args.timeout,
+    )
+
+    orchestrator = ReviewOrchestrator()
+    try:
+        res = _run_async(orchestrator.run_review(req))
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error resuming review session: {exc}", file=sys.stderr)
+        return 2
+
+    if res.status in (SessionStatus.COMPLETED, SessionStatus.APPROVED):
+        print(f"Sentinel: Review session '{res.session_id}' approved.")
+        return 0
+    elif res.status == SessionStatus.REJECTED:
+        print(f"Sentinel: Review session '{res.session_id}' rejected.", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """List recent review sessions and their outcomes from SQLite."""
+    store = SessionStore(db_path=args.db_path)
+    sessions = store.list_sessions(limit=args.limit)
+
+    if not sessions:
+        print("Sentinel: No review sessions found in database.")
+        return 0
+
+    print(f"{'SESSION ID':<20} {'BRANCH':<20} {'COMMIT':<12} {'STATUS':<24} {'UPDATED AT'}")
+    print("-" * 90)
+    for s in sessions:
+        short_commit = s.commit_sha[:10] if len(s.commit_sha) >= 10 else s.commit_sha
+        print(
+            f"{s.session_id:<20} {s.branch_name:<20} {short_commit:<12} {s.status.value:<24} {s.updated_at}"
+        )
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct command-line argument parser for Sentinel."""
     parser = argparse.ArgumentParser(
@@ -171,6 +249,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to SQLite session database (default: .sentinel/session.db)",
     )
 
+    # resume command
+    resume_parser = subparsers.add_parser(
+        "resume",
+        help="Resume an existing or pending review session from SQLite storage",
+    )
+    resume_parser.add_argument(
+        "session_id",
+        nargs="?",
+        default=None,
+        help="Session ID to resume (default: most recent pending approval session)",
+    )
+    resume_parser.add_argument(
+        "--workspace",
+        "-w",
+        default=".",
+        help="Path to workspace root directory (default: current directory)",
+    )
+    resume_parser.add_argument(
+        "--timeout",
+        "-t",
+        type=int,
+        default=60,
+        help="Timeout in seconds for subagent execution (default: 60)",
+    )
+    resume_parser.add_argument(
+        "--db-path",
+        default=".sentinel/session.db",
+        help="Path to SQLite session database (default: .sentinel/session.db)",
+    )
+
+    # list command
+    list_parser = subparsers.add_parser(
+        "list",
+        help="List recent review sessions and statuses",
+    )
+    list_parser.add_argument(
+        "--db-path",
+        default=".sentinel/session.db",
+        help="Path to SQLite session database (default: .sentinel/session.db)",
+    )
+    list_parser.add_argument(
+        "--limit",
+        "-l",
+        type=int,
+        default=20,
+        help="Maximum number of sessions to display (default: 20)",
+    )
+
     return parser
 
 
@@ -185,6 +311,10 @@ def main(argv: list[str] | None = None) -> int:
             # Invoked as bare `sentinel` with no args
             args = parser.parse_args(["check", *(argv or [])])
         return cmd_check(args)
+    elif args.subcommand == "resume":
+        return cmd_resume(args)
+    elif args.subcommand == "list":
+        return cmd_list(args)
 
     return 0
 

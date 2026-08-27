@@ -344,6 +344,56 @@ class SessionStore:
                 (SessionStatus.COMPLETED.value, now, session_id),
             )
 
+    def transition_session(
+        self, session_id: str, new_status: SessionStatus
+    ) -> ReviewSession | None:
+        """Explicitly transition a session to a new lifecycle status."""
+        now = datetime.now(UTC).isoformat()
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE review_sessions SET status = ?, updated_at = ? WHERE session_id = ?",
+                (new_status.value, now, session_id),
+            )
+        return self.get_session(session_id)
+
+    def list_sessions(self, limit: int = 20) -> list[ReviewSession]:
+        """List review sessions ordered by updated_at descending."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id, branch_name, commit_sha, created_at, updated_at, status, diff_summary
+                FROM review_sessions
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        sessions: list[ReviewSession] = []
+        for r in rows:
+            sess = self.get_session(r["session_id"])
+            if sess:
+                sessions.append(sess)
+        return sessions
+
+    def get_latest_pending_session(self) -> ReviewSession | None:
+        """Retrieve the most recent session awaiting human approval."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT session_id
+                FROM review_sessions
+                WHERE status = ?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (SessionStatus.PENDING_HUMAN_APPROVAL.value,),
+            ).fetchone()
+
+        if not row:
+            return None
+        return self.get_session(row["session_id"])
+
 
 if __name__ == "__main__":
     # Framework-free self-check (Rule 2903681)
