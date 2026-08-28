@@ -73,30 +73,66 @@ Queries historical ADRs from LACE memory and evaluates proposed git diffs:
 ### 5. Concurrent Review Orchestrator & Approval Gate
 `ReviewOrchestrator` runs Subagent A and Subagent B concurrently via `asyncio.gather()`, aggregates outputs into a rich Markdown approval card, accepts exact approval tokens (`approve`, `a`, `yes`, `y`), and enforces fail-closed security.
 
+### 6. TrueForge Agent Harness Integration
+Sentinel implements `TrueForgeAdapter` (`src/sentinel/trueforge_adapter.py`), exposing standardized tools to the TrueForge agent framework:
+- `sentinel_check_diff`: Reviews workspace diffs across `unstaged`, `staged`, `branch`, or `working_tree` modes.
+- `sentinel_query_adrs`: Fetches relevant ADRs from LACE memory for touched files.
+- `sentinel_run_sandbox`: Executes isolated test/lint suites in cloud sandboxes.
+- `sentinel_resolve_approval`: Resolves pending approval gates, automatically committing approved ADRs to LACE.
+
+Configured via `config/trueforge.config.yaml` with fail-closed gating policies on sensitive operations (`remember`, `git_push`).
+
+---
+
+## CLI Usage Guide
+
+```bash
+# Run review on current diff (interactive terminal card)
+uv run sentinel check
+
+# Run review in non-interactive CI mode (returns pending state or status)
+uv run sentinel check --non-interactive
+
+# List recent review sessions from SQLite store
+uv run sentinel list
+
+# Resume a pending review session by ID
+uv run sentinel resume sess_0d096597
+
+# Install / Uninstall Git pre-push hook
+uv run sentinel install-hook
+uv run sentinel uninstall-hook
+```
+
 ---
 
 ## Key Files Map
 
 | Path | Primary Responsibility |
 | :--- | :--- |
+| `src/sentinel/trueforge_adapter.py` | TrueForge Agent Harness Adapter exposing standardized tools and security gating. |
+| `src/sentinel/cli.py` | Command-line interface (`check`, `resume`, `list`, `install-hook`, `uninstall-hook`). |
 | `src/sentinel/orchestrator.py` | Concurrent multi-subagent review coordinator and approval lifecycle orchestrator. |
 | `src/sentinel/subagents/adr_delta_analyzer.py` | Subagent B: LACE ADR delta reasoning analyzer, constraint scanner, and MADR 3.0 draft generator. |
 | `src/sentinel/subagents/sandbox_runner.py` | Subagent A: Daytona cloud sandbox runner with workspace synchronization and lifecycle safety guarantees. |
 | `src/sentinel/approval_gate.py` | Formats Markdown approval cards, processes interactive approval input, and records final audit decisions. |
-| `src/sentinel/session_store.py` | SQLite persistence layer with automatic schema migration (table rebuilds for composite keys). |
+| `src/sentinel/session_store.py` | SQLite persistence layer with automatic schema migration (composite primary keys). |
+| `src/sentinel/git_utils.py` | Git context extraction and diff parsing across unstaged, staged, and branch modes. |
+| `src/sentinel/hooks.py` | Automated git pre-push hook installer and uninstaller. |
 | `src/sentinel/mcp/lace_client.py` | Async MCP client communicating with LACE memory servers; parses ADRs and tracks architectural context. |
 | `src/sentinel/mcp/types.py` | Pydantic response models enforcing strict trust boundary validation for external MCP payloads. |
 | `src/sentinel/models/adr.py` | MADR 3.0.0 parser and serializer handling YAML frontmatter and Markdown bodies. |
 | `src/sentinel/models/diff.py` | Unified git diff parser supporting Unicode octal escapes, diff header isolation, and whitespace preservation. |
 | `src/sentinel/models/review_state.py` | Domain enums and dataclasses (`ReviewSession`, `SubagentTask`, `ApprovalActionType`, `SessionStatus`). |
-| `scripts/live_daytona_test.py` | End-to-end integration script executing real cloud sandbox tests and the human approval gate. |
+| `tests/test_e2e/test_trueforge_e2e.py` | Deterministic end-to-end multi-agent cross-session lifecycle test suite. |
+| `docs/DEMO_SCRIPT.md` | Timed 3-minute hackathon demonstration script and recording walkthrough. |
 
 ---
 
 ## Prerequisites and Local Setup
 
 ### System Requirements
-- Python >= 3.13
+- Python >= 3.11 (tested on 3.11, 3.12, 3.13)
 - `uv` package manager (>= 0.5.0 recommended)
 - Git >= 2.30
 
@@ -124,7 +160,7 @@ $env:DAYTONA_API_KEY = "your_daytona_api_key"
 
 ## Developer Runbooks
 
-### Run Automated Unit Tests
+### Run Automated Test Suite (92 Tests)
 
 ```bash
 uv run pytest -v
@@ -135,7 +171,7 @@ uv run pytest -v
 Sentinel modules include framework-free standalone test suites that can be executed directly without `pytest`:
 
 ```bash
-uv run python -m sentinel.orchestrator
+uv run python src/sentinel/trueforge_adapter.py
 uv run python src/sentinel/subagents/adr_delta_analyzer.py
 uv run python src/sentinel/subagents/sandbox_runner.py
 uv run python src/sentinel/approval_gate.py
@@ -154,12 +190,6 @@ uv run ruff check src tests scripts
 
 # Verify format compliance
 uv run ruff format --check src tests scripts
-```
-
-### Live Cloud Sandbox Verification
-
-```bash
-uv run python scripts/live_daytona_test.py
 ```
 
 ---
