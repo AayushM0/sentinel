@@ -219,6 +219,9 @@ class ReviewOrchestrator:
         elif decision == ApprovalDecision.REJECTED:
             session.status = SessionStatus.REJECTED
         else:
+            hydrated = request.session_store.get_session(request.session_id)
+            if hydrated is not None:
+                return hydrated
             session.status = SessionStatus.PENDING_HUMAN_APPROVAL
 
         return session

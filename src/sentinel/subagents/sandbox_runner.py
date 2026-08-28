@@ -253,6 +253,11 @@ class SandboxRunner:
                 rel_parts = set(item.relative_to(root_resolved).parts)
                 if rel_parts.intersection(_IGNORED_DIRS):
                     continue
+                try:
+                    if not item.resolve().is_relative_to(root_resolved):
+                        continue
+                except OSError:
+                    continue
                 candidates.add(item)
 
         for cf in changed_files:

@@ -8,8 +8,12 @@ on:
 
 jobs:
   test:
-    name: Lint & Test Suite
+    name: Lint & Test Suite (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
 
     steps:
       - name: Check out repository
@@ -21,8 +25,8 @@ jobs:
           enable-cache: true
           version: "latest"
 
-      - name: Set up Python
-        run: uv python install 3.12
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: uv sync --all-extras --dev
@@ -33,5 +37,15 @@ jobs:
       - name: Run Ruff Format Check
         run: uv run ruff format --check src tests
 
+      - name: Run Standalone Self-Checks (Rule 2903681)
+        run: |
+          uv run python src/sentinel/trueforge_adapter.py
+          uv run python src/sentinel/subagents/adr_delta_analyzer.py
+          uv run python src/sentinel/subagents/sandbox_runner.py
+          uv run python src/sentinel/approval_gate.py
+
       - name: Run Pytest Suite
         run: uv run pytest -v
+
+      - name: Verify Sentinel CLI
+        run: uv run sentinel list
