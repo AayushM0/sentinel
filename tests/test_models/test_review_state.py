@@ -19,6 +19,7 @@ def test_review_state_enums():
 
     assert SubagentType.SANDBOX_RUNNER.value == "SANDBOX_RUNNER"
     assert SubagentType.ADR_DELTA_ANALYZER.value == "ADR_DELTA_ANALYZER"
+    assert SubagentType.GITHUB_PR.value == "GITHUB_PR"
 
     assert SubagentStatus.RUNNING.value == "RUNNING"
     assert SubagentStatus.COMPLETED.value == "COMPLETED"

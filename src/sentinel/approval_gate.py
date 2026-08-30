@@ -23,6 +23,7 @@ class ApprovalGate:
         commit_sha: str,
         test_result: dict[str, Any],
         delta_report: dict[str, Any],
+        github_result: dict[str, Any] | None = None,
     ) -> str:
         """Format a rich Markdown approval card for Chat UI and CLI terminal."""
         sandbox_status = str(test_result.get("sandbox_status", "completed")).lower()
@@ -84,6 +85,32 @@ class ApprovalGate:
                 p_title = p.get("title", "Untitled Pattern")
                 lines.append(f"  - **{p_id}**: {p_title}")
 
+        # GitHub PR section (if available)
+        if github_result and not github_result.get("error"):
+            pr_meta = github_result.get("pr_metadata", {})
+            checks = github_result.get("checks", [])
+            lines.extend(
+                [
+                    "",
+                    "#### 3. GitHub PR Status",
+                    f"- **PR #{github_result.get('pr_number', '?')}**: {pr_meta.get('title', 'N/A')}",
+                    f"- **Author:** @{pr_meta.get('author', 'unknown')}",
+                    f"- **Files changed:** {len(github_result.get('files') or [])}",
+                ]
+            )
+            if checks:
+                passing = sum(1 for c in checks if c.get("conclusion") == "success")
+                failing = sum(1 for c in checks if c.get("conclusion") == "failure")
+                lines.append(f"- **CI Checks:** {passing} passing, {failing} failing")
+        elif github_result and github_result.get("error"):
+            lines.extend(
+                [
+                    "",
+                    "#### 3. GitHub PR Status",
+                    f"- **Error:** {github_result['error']}",
+                ]
+            )
+
         lines.extend(
             [
                 "",
@@ -104,6 +131,7 @@ class ApprovalGate:
         delta_report: dict[str, Any],
         action_type: ApprovalActionType = ApprovalActionType.PRE_PUSH_COMMIT,
         interactive: bool = True,
+        github_result: dict[str, Any] | None = None,
     ) -> ApprovalDecision:
         """Prompt user for approval or register pending approval state in SQLite."""
         card = self.format_approval_card(
@@ -112,6 +140,7 @@ class ApprovalGate:
             commit_sha=session.commit_sha,
             test_result=test_result,
             delta_report=delta_report,
+            github_result=github_result,
         )
 
         pending_appr = None

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import logging
+import os
 import sys
 import uuid
 from collections.abc import Coroutine
@@ -18,9 +19,9 @@ if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 
 from sentinel.git_utils import GitError, extract_git_context
-from sentinel.mcp.lace_client import LaceMcpClient
+from sentinel.mcp.lace_client import LaceMcpClient, _load_dotenv
 from sentinel.models.diff import parse_git_diff
-from sentinel.models.review_state import SessionStatus
+from sentinel.models.review_state import ReviewSession, SessionStatus
 from sentinel.orchestrator import OrchestratorRequest, ReviewOrchestrator
 from sentinel.session_store import SessionStore
 
@@ -40,14 +41,17 @@ def _run_async(coro: Coroutine[Any, Any, Any]) -> Any:
     return asyncio.run(coro)
 
 
-def _get_lace_client(workspace_root: Path) -> LaceMcpClient:
-    """Instantiate and configure LaceMcpClient for workspace."""
-    return LaceMcpClient()
+async def _get_lace_client(workspace_root: Path) -> LaceMcpClient:
+    """Instantiate, connect, and configure LaceMcpClient for workspace."""
+    client = LaceMcpClient()
+    await client.connect()
+    return client
 
 
 def cmd_check(args: argparse.Namespace) -> int:
     """Execute pre-push architectural and sandbox check on current diff."""
     workspace_root = Path(args.workspace).resolve()
+    _load_dotenv(workspace_root)  # Load .env from workspace root
 
     # Determine extraction mode
     mode = "unstaged"
@@ -71,33 +75,60 @@ def cmd_check(args: argparse.Namespace) -> int:
     session_id = f"sess_{uuid.uuid4().hex[:8]}"
     store = SessionStore(db_path=args.db_path)
     diff_summary = f"Branch '{git_ctx.branch_name}' (mode: {mode}) touching {len(git_ctx.touched_files)} file(s)"
+    pr_number = getattr(args, "pr", None)
+    repo = getattr(args, "repo", None) or os.environ.get("GITHUB_REPO")
+
+    # Validate PR number and repo
+    if pr_number is not None:
+        if pr_number < 1:
+            print(f"Error: --pr must be a positive integer, got {pr_number}", file=sys.stderr)
+            return 2
+        if not repo:
+            print("Error: --pr requires --repo or GITHUB_REPO env var", file=sys.stderr)
+            return 2
+        if "/" not in repo:
+            print(f"Error: --repo must be in owner/repo format, got '{repo}'", file=sys.stderr)
+            return 2
+
     store.create_session(
         session_id=session_id,
         branch_name=git_ctx.branch_name,
         commit_sha=git_ctx.commit_sha,
         diff_summary=diff_summary,
         raw_diff=git_ctx.raw_diff,
+        pr_number=pr_number,
+        repo=repo,
     )
-    lace_client = _get_lace_client(workspace_root)
     git_diff = parse_git_diff(git_ctx.raw_diff)
 
-    req = OrchestratorRequest(
-        session_id=session_id,
-        branch_name=git_ctx.branch_name,
-        commit_sha=git_ctx.commit_sha,
-        diff_summary=diff_summary,
-        git_diff=git_diff,
-        touched_files=git_ctx.touched_files,
-        workspace_root=workspace_root,
-        lace_client=lace_client,
-        session_store=store,
-        interactive=not args.non_interactive,
-        timeout_seconds=args.timeout,
-    )
+    async def _run_check_async() -> ReviewSession:
+        lace_client = await _get_lace_client(workspace_root)
+        try:
+            req = OrchestratorRequest(
+                session_id=session_id,
+                branch_name=git_ctx.branch_name,
+                commit_sha=git_ctx.commit_sha,
+                diff_summary=diff_summary,
+                git_diff=git_diff,
+                touched_files=git_ctx.touched_files,
+                workspace_root=workspace_root,
+                lace_client=lace_client,
+                session_store=store,
+                interactive=not args.non_interactive,
+                timeout_seconds=args.timeout,
+                pr_number=pr_number,
+                repo=repo,
+            )
+            orchestrator = ReviewOrchestrator()
+            return await orchestrator.run_review(req)
+        finally:
+            await lace_client.close()
 
-    orchestrator = ReviewOrchestrator()
     try:
-        session = _run_async(orchestrator.run_review(req))
+        session = _run_async(_run_check_async())
+    except TimeoutError:
+        print(f"Sentinel: Review session timed out after {args.timeout}s.", file=sys.stderr)
+        return 2
     except Exception as exc:  # noqa: BLE001
         print(f"Error running review orchestrator: {exc}", file=sys.stderr)
         return 2
@@ -141,27 +172,35 @@ def cmd_resume(args: argparse.Namespace) -> int:
         )
         return 0 if session.status in (SessionStatus.COMPLETED, SessionStatus.APPROVED) else 1
 
-    lace_client = _get_lace_client(workspace_root)
     git_diff = parse_git_diff(session.raw_diff)
     touched = [f.path for f in git_diff.files]
 
-    req = OrchestratorRequest(
-        session_id=session.session_id,
-        branch_name=session.branch_name,
-        commit_sha=session.commit_sha,
-        diff_summary=session.diff_summary,
-        git_diff=git_diff,
-        touched_files=touched,
-        workspace_root=workspace_root,
-        lace_client=lace_client,
-        session_store=store,
-        interactive=True,
-        timeout_seconds=args.timeout,
-    )
+    async def _run_resume_async() -> ReviewSession:
+        lace_client = await _get_lace_client(workspace_root)
+        try:
+            req = OrchestratorRequest(
+                session_id=session.session_id,
+                branch_name=session.branch_name,
+                commit_sha=session.commit_sha,
+                diff_summary=session.diff_summary,
+                git_diff=git_diff,
+                touched_files=touched,
+                workspace_root=workspace_root,
+                lace_client=lace_client,
+                session_store=store,
+                interactive=True,
+                timeout_seconds=args.timeout,
+            )
+            orchestrator = ReviewOrchestrator()
+            return await orchestrator.run_review(req)
+        finally:
+            await lace_client.close()
 
-    orchestrator = ReviewOrchestrator()
     try:
-        res = _run_async(orchestrator.run_review(req))
+        res = _run_async(_run_resume_async())
+    except TimeoutError:
+        print(f"Sentinel: Resume session timed out after {args.timeout}s.", file=sys.stderr)
+        return 2
     except Exception as exc:  # noqa: BLE001
         print(f"Error resuming review session: {exc}", file=sys.stderr)
         return 2
@@ -279,13 +318,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         "-t",
         type=int,
-        default=60,
-        help="Timeout in seconds for subagent execution (default: 60)",
+        default=300,
+        help="Timeout in seconds for subagent execution (default: 300)",
     )
     check_parser.add_argument(
         "--db-path",
         default=".sentinel/session.db",
         help="Path to SQLite session database (default: .sentinel/session.db)",
+    )
+    check_parser.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        help="GitHub PR number to review (enables GitHub integration)",
+    )
+    check_parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="GitHub repository in owner/repo format (default: GITHUB_REPO env var)",
     )
 
     # resume command
@@ -309,8 +360,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         "-t",
         type=int,
-        default=60,
-        help="Timeout in seconds for subagent execution (default: 60)",
+        default=300,
+        help="Timeout in seconds for subagent execution (default: 300)",
     )
     resume_parser.add_argument(
         "--db-path",
@@ -365,6 +416,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Main CLI entry point."""
+    _load_dotenv(Path.cwd())  # Load .env into os.environ for all components
     parser = build_parser()
     args = parser.parse_args(argv)
 

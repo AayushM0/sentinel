@@ -22,4 +22,11 @@ wheels/
 ACTION.md
 CLAUDE.md
 
-docs/
+docs/
+# Environment secrets
+.env
+.env.*
+*.env
+
+# Sentinel session database
+.sentinel/

@@ -113,6 +113,15 @@ class SessionStore:
                     """
                 )
 
+            # Schema migration: add pr_number and repo columns if not present
+            sess_cols = [
+                r["name"] for r in conn.execute("PRAGMA table_info(review_sessions);").fetchall()
+            ]
+            if "pr_number" not in sess_cols:
+                conn.execute("ALTER TABLE review_sessions ADD COLUMN pr_number INTEGER;")
+            if "repo" not in sess_cols:
+                conn.execute("ALTER TABLE review_sessions ADD COLUMN repo TEXT;")
+
     def create_session(
         self,
         branch_name: str,
@@ -120,6 +129,8 @@ class SessionStore:
         diff_summary: str = "",
         session_id: str | None = None,
         raw_diff: str = "",
+        pr_number: int | None = None,
+        repo: str | None = None,
     ) -> ReviewSession:
         """Create a new review session in initial PENDING_SUBAGENTS status."""
         sess_id = session_id or f"sess_{uuid.uuid4().hex[:8]}"
@@ -129,10 +140,21 @@ class SessionStore:
         with self._get_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO review_sessions (session_id, branch_name, commit_sha, created_at, updated_at, status, diff_summary, raw_diff)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO review_sessions (session_id, branch_name, commit_sha, created_at, updated_at, status, diff_summary, raw_diff, pr_number, repo)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (sess_id, branch_name, commit_sha, now, now, status.value, diff_summary, raw_diff),
+                (
+                    sess_id,
+                    branch_name,
+                    commit_sha,
+                    now,
+                    now,
+                    status.value,
+                    diff_summary,
+                    raw_diff,
+                    pr_number,
+                    repo,
+                ),
             )
 
         return ReviewSession(
@@ -144,6 +166,8 @@ class SessionStore:
             status=status,
             diff_summary=diff_summary,
             raw_diff=raw_diff,
+            pr_number=pr_number,
+            repo=repo,
         )
 
     def save_subagent_result(
@@ -286,6 +310,8 @@ class SessionStore:
                 status=SessionStatus(sess_row["status"]),
                 diff_summary=sess_row["diff_summary"],
                 raw_diff=sess_row["raw_diff"] if "raw_diff" in tuple(sess_row.keys()) else "",
+                pr_number=sess_row["pr_number"] if "pr_number" in tuple(sess_row.keys()) else None,
+                repo=sess_row["repo"] if "repo" in tuple(sess_row.keys()) else None,
                 tasks=tasks,
                 pending_approval=pending_appr,
             )

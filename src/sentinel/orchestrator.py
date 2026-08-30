@@ -36,6 +36,11 @@ from sentinel.subagents.adr_delta_analyzer import (
     DeltaReport,
     DeltaRequest,
 )
+from sentinel.subagents.github_pr_agent import (
+    GitHubPRAgent,
+    GitHubPRRequest,
+    GitHubPRResult,
+)
 from sentinel.subagents.sandbox_runner import (
     SandboxRequest,
     SandboxResult,
@@ -60,7 +65,9 @@ class OrchestratorRequest:
     session_store: SessionStore
     daytona_client: Any = None
     interactive: bool = True
-    timeout_seconds: int = 60
+    timeout_seconds: int = 300
+    pr_number: int | None = None
+    repo: str | None = None
 
     def __post_init__(self) -> None:
         if not self.session_id:
@@ -76,11 +83,34 @@ class ReviewOrchestrator:
         self,
         sandbox_runner: SandboxRunner | None = None,
         adr_analyzer: ADRDeltaAnalyzer | None = None,
+        github_agent: GitHubPRAgent | None = None,
         approval_gate: ApprovalGate | None = None,
     ) -> None:
         self.sandbox_runner = sandbox_runner or SandboxRunner()
         self.adr_analyzer = adr_analyzer or ADRDeltaAnalyzer()
+        self._github_agent = github_agent
         self.approval_gate = approval_gate or ApprovalGate()
+
+    @property
+    def github_agent(self) -> GitHubPRAgent:
+        """Lazy-initialize GitHub agent only when needed."""
+        if self._github_agent is None:
+            self._github_agent = GitHubPRAgent()
+        return self._github_agent
+
+    def _get_github_agent_for_repo(self, repo: str) -> GitHubPRAgent:
+        """Create a GitHub agent scoped to a specific repository."""
+        from sentinel.mcp.github_client import GitHubClient
+        from sentinel.mcp.github_server import GitHubMCPServer
+
+        try:
+            client = GitHubClient(repo=repo)
+        except ValueError:
+            # No GITHUB_TOKEN configured — return agent with no client
+            logger.warning("GITHUB_TOKEN not set — GitHub integration unavailable")
+            return GitHubPRAgent()
+        server = GitHubMCPServer(client=client)
+        return GitHubPRAgent(server=server)
 
     async def run_review(self, request: OrchestratorRequest) -> ReviewSession:
         """Run subagents concurrently, prompt approval gate, and commit approved ADRs."""
@@ -105,18 +135,24 @@ class ReviewOrchestrator:
                     ),
                     None,
                 )
+                github_task = next(
+                    (t for t in existing.tasks if t.subagent_type == SubagentType.GITHUB_PR),
+                    None,
+                )
                 if sb_task and adr_task:
                     test_result = sb_task.result_payload or {}
                     delta_report = adr_task.result_payload or {}
+                    github_result = github_task.result_payload if github_task else None
                     self.approval_gate.session_store = request.session_store
                     decision = self.approval_gate.request_approval(
                         session=existing,
                         test_result=test_result,
                         delta_report=delta_report,
                         interactive=request.interactive,
+                        github_result=github_result,
                     )
                     return await self._handle_approval_decision(
-                        request, existing, decision, delta_report
+                        request, existing, decision, delta_report, github_result
                     )
         else:
             request.session_store.create_session(
@@ -151,13 +187,68 @@ class ReviewOrchestrator:
 
         # 3. Execute Subagents concurrently with fault isolation
         sandbox_coro = self._run_sandbox_safely(sandbox_req, request.session_store)
-        adr_coro = self._run_adr_safely(delta_req, request.session_store)
 
-        sb_res, adr_res = await asyncio.gather(sandbox_coro, adr_coro)
+        # Skip ADR analysis if LACE is degraded (server unavailable)
+        lace_degraded = (
+            getattr(request.lace_client, "degraded", False) or not request.lace_client.is_connected
+        )
+        if lace_degraded:
+            logger.warning("LACE server unavailable — skipping ADR delta analysis")
+            adr_res = DeltaReport(
+                session_id=request.session_id,
+                violations=[],
+                summary="ADR analysis skipped — LACE server unavailable",
+            )
+            # Persist the degraded ADR task so resume doesn't rerun sandbox
+            request.session_store.save_subagent_result(
+                session_id=request.session_id,
+                subagent_type=SubagentType.ADR_DELTA_ANALYZER,
+                status=SubagentStatus.COMPLETED,
+                result_payload=adr_res.to_dict(),
+                task_id=f"{request.session_id}_adr",
+            )
+            adr_coro = None
+        else:
+            adr_coro = self._run_adr_safely(delta_req, request.session_store)
+
+        # Optionally run GitHub PR subagent in parallel
+        github_coro = None
+        if request.pr_number and request.repo:
+            github_req = GitHubPRRequest(
+                session_id=request.session_id,
+                pr_number=request.pr_number,
+                repo=request.repo,
+            )
+            # Use repo-scoped agent instead of generic one
+            agent = self._get_github_agent_for_repo(request.repo)
+            github_coro = self._run_github_safely(github_req, request.session_store, agent=agent)
+
+        # Build list of active coroutines
+        active_coros = [sandbox_coro]
+        if adr_coro is not None:
+            active_coros.append(adr_coro)
+        if github_coro is not None:
+            active_coros.append(github_coro)
+
+        results = await asyncio.wait_for(
+            asyncio.gather(*active_coros),
+            timeout=float(request.timeout_seconds),
+        )
+
+        # Unpack results in order
+        sb_res = results[0]
+        idx = 1
+        if adr_coro is not None:
+            adr_res = results[idx]
+            idx += 1
+        github_res = results[idx] if github_coro is not None else None
 
         # 4. Prepare structured dictionary payloads for ApprovalGate
         test_result = sb_res.to_dict() if hasattr(sb_res, "to_dict") else sb_res
         delta_report = adr_res.to_dict() if hasattr(adr_res, "to_dict") else adr_res
+        github_result = (
+            github_res.to_dict() if github_res and hasattr(github_res, "to_dict") else github_res
+        )
 
         # 5. Fetch updated session model
         session = request.session_store.get_session(request.session_id)
@@ -171,10 +262,13 @@ class ReviewOrchestrator:
             test_result=test_result,
             delta_report=delta_report,
             interactive=request.interactive,
+            github_result=github_result,
         )
 
         # 7. Apply human decision & post-approval side effects
-        return await self._handle_approval_decision(request, session, decision, adr_res)
+        return await self._handle_approval_decision(
+            request, session, decision, adr_res, github_result
+        )
 
     async def _handle_approval_decision(
         self,
@@ -182,11 +276,29 @@ class ReviewOrchestrator:
         session: ReviewSession,
         decision: ApprovalDecision,
         adr_res: Any,
+        github_result: dict | None = None,
     ) -> ReviewSession:
-        """Process approval outcome, commit proposed ADRs, and transition session lifecycle."""
+        """Process approval outcome, commit proposed ADRs, post GitHub review, and transition session lifecycle."""
         if decision == ApprovalDecision.APPROVED:
             session.status = SessionStatus.APPROVED
             all_committed = True
+
+            # Post GitHub review if PR context is available
+            if github_result and request.pr_number and request.repo:
+                try:
+                    agent = self._get_github_agent_for_repo(request.repo)
+                    await agent.post_review(
+                        pr_number=request.pr_number,
+                        repo=request.repo,
+                        body=self._build_github_review_body(
+                            test_result=None, delta_report=None, github_result=github_result
+                        ),
+                        event="APPROVE",
+                    )
+                    logger.info("Posted approval review on PR #%s", request.pr_number)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Failed to post GitHub review: %s", exc)
+                    # Don't fail the whole session for a review post failure
 
             # Rehydrate proposed ADRs if present
             proposed_list = getattr(adr_res, "proposed_adrs", None)
@@ -225,6 +337,37 @@ class ReviewOrchestrator:
             session.status = SessionStatus.PENDING_HUMAN_APPROVAL
 
         return session
+
+    def _build_github_review_body(
+        self, test_result: Any, delta_report: Any, github_result: dict
+    ) -> str:
+        """Build a structured review body for GitHub PR."""
+        lines = ["## Sentinel Review Summary\n"]
+
+        # Sandbox results
+        if test_result:
+            status = test_result.get("sandbox_status", "unknown")
+            passed = test_result.get("tests_passed", 0)
+            failed = test_result.get("tests_failed", 0)
+            lines.append(f"### Tests\n- Status: {status}\n- Passed: {passed}, Failed: {failed}\n")
+
+        # ADR results
+        if delta_report:
+            violations = delta_report.get("violations", [])
+            if violations:
+                lines.append(f"### ADR Violations\n{len(violations)} violation(s) detected\n")
+            else:
+                lines.append("### ADR\nNo violations detected\n")
+
+        # GitHub CI
+        checks = github_result.get("checks", []) if github_result else []
+        if checks:
+            passing = sum(1 for c in checks if c.get("conclusion") == "success")
+            failing = sum(1 for c in checks if c.get("conclusion") == "failure")
+            lines.append(f"### CI Checks\n- Passing: {passing}\n- Failing: {failing}\n")
+
+        lines.append("\n---\n*Reviewed by Sentinel*")
+        return "\n".join(lines)
 
     async def _run_sandbox_safely(self, req: SandboxRequest, store: SessionStore) -> SandboxResult:
         """Execute SandboxRunner with top-level error capture; single persistence owner."""
@@ -270,6 +413,40 @@ class ReviewOrchestrator:
                 violations=[],
                 summary=f"ADRDeltaAnalyzer failed: {exc}",
             )
+
+    async def _run_github_safely(
+        self, req: GitHubPRRequest, store: SessionStore, agent: GitHubPRAgent | None = None
+    ) -> GitHubPRResult:
+        """Execute GitHubPRAgent with top-level error capture; single persistence owner."""
+        gh = agent or self.github_agent
+        owns_client = agent is not None  # Only close clients we created
+        try:
+            return await gh.fetch_pr_context(req)
+        except Exception as exc:  # noqa: BLE001
+            err_msg = f"GitHubPRAgent failed: {exc}"
+            logger.error("%s\n%s", err_msg, traceback.format_exc())
+            store.save_subagent_result(
+                session_id=req.session_id,
+                subagent_type=SubagentType.GITHUB_PR,
+                status=SubagentStatus.FAILED,
+                result_payload={"error": str(exc), "traceback": traceback.format_exc()},
+                task_id=f"{req.session_id}_github",
+            )
+            return GitHubPRResult(
+                session_id=req.session_id,
+                pr_number=req.pr_number,
+                repo=req.repo,
+                error=str(exc),
+            )
+        finally:
+            # Close HTTP client only if we created it (not injected)
+            if owns_client and hasattr(gh, "server") and hasattr(gh.server, "client"):
+                client = gh.server.client
+                if client and hasattr(client, "_client") and hasattr(client._client, "aclose"):
+                    try:
+                        await client._client.aclose()
+                    except Exception:
+                        logger.debug("Failed to close GitHub HTTP client", exc_info=True)
 
 
 if __name__ == "__main__":

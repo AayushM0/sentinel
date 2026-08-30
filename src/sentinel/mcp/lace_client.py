@@ -18,7 +18,32 @@ from sentinel.mcp.types import LaceContextResponse, LaceMemoryItem
 from sentinel.models.adr import ADR
 
 
+def _load_dotenv(search_from: Path) -> None:
+    """Load .env file into os.environ if it exists, without overwriting existing vars."""
+    env_file = search_from / ".env"
+    if not env_file.is_file():
+        return
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            # Remove surrounding quotes
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except (ValueError, OSError):  # malformed key/value or file read error
+        pass
+
+
 def _default_server_config() -> tuple[str, list[str], dict[str, str]]:
+    _load_dotenv(Path.cwd())
     env_lace_path = os.environ.get("LACE_PATH")
     if env_lace_path:
         lace_dir = Path(env_lace_path)
@@ -76,8 +101,19 @@ class LaceMcpClient:
         """Return whether client has an active MCP session."""
         return self._is_connected and self._session is not None
 
-    async def connect(self) -> None:
-        """Establish stdio MCP connection to LACE server with leak-proof cleanup on failure."""
+    @property
+    def degraded(self) -> bool:
+        """Return whether client is in degraded mode (server unavailable)."""
+        return getattr(self, "_degraded", False)
+
+    async def connect(self, *, _retries: int = 1) -> None:
+        """Establish stdio MCP connection to LACE server with leak-proof cleanup on failure.
+
+        If connection fails (e.g. server already running, binary not found,
+        import errors in the LACE server), logs a warning and sets
+        ``_degraded = True`` so callers can gracefully skip ADR analysis
+        instead of crashing the whole agent.
+        """
         if self._is_connected and self._session is not None:
             return
 
@@ -88,22 +124,47 @@ class LaceMcpClient:
             env=self.server_env,
         )
 
-        try:
-            read_stream, write_stream = await self._exit_stack.enter_async_context(
-                stdio_client(server_params)
-            )
-            self._session = await self._exit_stack.enter_async_context(
-                ClientSession(read_stream, write_stream)
-            )
-            await self._session.initialize()
-            self._is_connected = True
-        except Exception:
-            if self._exit_stack is not None:
-                await self._exit_stack.aclose()
-                self._exit_stack = None
-            self._session = None
-            self._is_connected = False
-            raise
+        for attempt in range(1, _retries + 1):
+            try:
+                read_stream, write_stream = await self._exit_stack.enter_async_context(
+                    stdio_client(server_params)
+                )
+                self._session = await self._exit_stack.enter_async_context(
+                    ClientSession(read_stream, write_stream)
+                )
+                await self._session.initialize()
+                self._is_connected = True
+                return
+            except Exception as exc:  # noqa: BLE001
+                import logging
+
+                _log = logging.getLogger(__name__)
+                _log.warning(
+                    "LACE MCP connect attempt %d/%d failed: %s",
+                    attempt,
+                    _retries,
+                    exc,
+                )
+                # Clean up partial connection state
+                if self._exit_stack is not None:
+                    await self._exit_stack.aclose()
+                    self._exit_stack = None
+                self._session = None
+                self._is_connected = False
+
+                if attempt < _retries:
+                    import asyncio as _aio
+
+                    await _aio.sleep(0.5)
+                    continue
+
+                # All retries exhausted — enter degraded mode
+                self._degraded = True
+                _log.warning(
+                    "LACE MCP server unavailable — ADR analysis will be skipped. "
+                    "Set LACE_PATH in .env or start the LACE server manually."
+                )
+                return
 
     async def close(self) -> None:
         """Close stdio MCP session and terminate background processes."""

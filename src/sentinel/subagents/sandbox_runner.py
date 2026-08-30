@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover
     )  # type: ignore[misc,assignment]
     Image = None  # type: ignore[misc,assignment]
 
+from sentinel.models.github import SecurityAuditResult, SecurityVulnerability
 from sentinel.models.review_state import SubagentStatus, SubagentType
 from sentinel.session_store import SessionStore
 
@@ -230,6 +231,56 @@ class SandboxRunner:
         passed, failed = self._parse_pytest_output(tr.result)
         status = "completed" if tr.exit_code == 0 else "failed"
 
+        # 5. Security audit (non-fatal, informational)
+        security_findings: list[str] = []
+        try:
+            # Check for Python project and run pip-audit
+            check_py = await sandbox.process.exec(
+                f"cd {_WORKSPACE} && test -f pyproject.toml -o -f requirements.txt",
+                timeout=5,
+            )
+            if check_py.exit_code == 0:
+                # ponytail: pip-audit exit code 1 = vulnerabilities found (expected),
+                #           exit code 2+ = tool/install failure. Parse output regardless.
+                audit_res = await sandbox.process.exec(
+                    f"cd {_WORKSPACE} && pip install pip-audit -q && pip-audit --format json",
+                    timeout=60,
+                )
+                if audit_res.exit_code <= 1 and audit_res.result.strip():
+                    parsed = self._parse_pip_audit(audit_res.result)
+                    if parsed.vulnerabilities:
+                        security_findings.append(f"pip-audit: {parsed.summary}")
+                elif audit_res.exit_code > 1:
+                    security_findings.append(
+                        f"pip-audit: tool error (exit code {audit_res.exit_code})"
+                    )
+
+            # Check for JS project and run npm audit
+            check_js = await sandbox.process.exec(
+                f"cd {_WORKSPACE} && test -f package.json",
+                timeout=5,
+            )
+            if check_js.exit_code == 0:
+                audit_res = await sandbox.process.exec(
+                    f"cd {_WORKSPACE} && npm audit --json",
+                    timeout=60,
+                )
+                # npm audit exit code 1 = vulnerabilities found, 2+ = tool error
+                if audit_res.exit_code <= 1 and audit_res.result.strip():
+                    parsed = self._parse_npm_audit(audit_res.result)
+                    if parsed.vulnerabilities:
+                        security_findings.append(f"npm-audit: {parsed.summary}")
+                elif audit_res.exit_code > 1:
+                    security_findings.append(
+                        f"npm-audit: tool error (exit code {audit_res.exit_code})"
+                    )
+        except Exception as exc:  # noqa: BLE001
+            security_findings.append(f"Security audit error (non-fatal): {exc}")
+
+        logs = tr.result
+        if security_findings:
+            logs += "\n\n--- Security Audit ---\n" + "\n".join(security_findings)
+
         return SandboxResult(
             sandbox_status=status,
             exit_code=tr.exit_code,
@@ -237,7 +288,7 @@ class SandboxRunner:
             tests_failed=failed,
             linter_errors=linter_errors,
             duration_ms=int((time.monotonic() - start) * 1000),
-            logs=tr.result,
+            logs=logs,
         )
 
     def _collect_upload_paths(self, root: Path, changed_files: list[str]) -> list[Path]:
@@ -330,6 +381,79 @@ class SandboxRunner:
             if passed or failed:
                 break
         return passed, failed
+
+    def _parse_pip_audit(self, output: str) -> SecurityAuditResult:
+        """Parse pip-audit JSON output into SecurityAuditResult."""
+        import json
+
+        vulnerabilities = []
+        try:
+            data = json.loads(output)
+            for dep in data.get("dependencies", []):
+                for vuln in dep.get("vulns", []):
+                    vulnerabilities.append(
+                        SecurityVulnerability(
+                            package=dep["name"],
+                            installed_version=dep["version"],
+                            fixed_version=(vuln.get("fix_versions") or [None])[0],
+                            severity="high" if vuln.get("fix_versions") else "medium",
+                            advisory=vuln.get("id", ""),
+                            url=(vuln.get("aliases") or [None])[0],
+                        )
+                    )
+        except (json.JSONDecodeError, KeyError, IndexError):
+            pass
+
+        summary = (
+            f"Found {len(vulnerabilities)} vulnerabilities"
+            if vulnerabilities
+            else "No vulnerabilities found"
+        )
+        return SecurityAuditResult(
+            tool="pip-audit",
+            vulnerabilities=vulnerabilities,
+            summary=summary,
+            exit_code=1 if vulnerabilities else 0,
+        )
+
+    def _parse_npm_audit(self, output: str) -> SecurityAuditResult:
+        """Parse npm audit JSON output into SecurityAuditResult."""
+        import json
+
+        vulnerabilities = []
+        try:
+            data = json.loads(output)
+            for pkg, info in data.get("vulnerabilities", {}).items():
+                via = info.get("via", [{}])
+                url = via[0].get("url") if via and isinstance(via[0], dict) else None
+                vulnerabilities.append(
+                    SecurityVulnerability(
+                        package=pkg,
+                        installed_version=info.get("version", "unknown"),
+                        fixed_version=info.get("fixAvailable", {}).get("version")
+                        if isinstance(info.get("fixAvailable"), dict)
+                        else None,
+                        severity=info.get("severity", "unknown"),
+                        advisory=via[0].get("title", "")
+                        if via and isinstance(via[0], dict)
+                        else "",
+                        url=url,
+                    )
+                )
+        except (json.JSONDecodeError, KeyError, IndexError):
+            pass
+
+        summary = (
+            f"Found {len(vulnerabilities)} vulnerabilities"
+            if vulnerabilities
+            else "No vulnerabilities found"
+        )
+        return SecurityAuditResult(
+            tool="npm-audit",
+            vulnerabilities=vulnerabilities,
+            summary=summary,
+            exit_code=1 if vulnerabilities else 0,
+        )
 
     def _persist(self, request: SandboxRequest, result: SandboxResult) -> None:
         """Save result to SessionStore if one was provided."""
