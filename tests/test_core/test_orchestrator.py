@@ -24,6 +24,8 @@ def mock_lace_client() -> LaceMcpClient:
     client = AsyncMock(spec=LaceMcpClient)
     client.get_relevant_adrs = AsyncMock(return_value=[])
     client.commit_adr = AsyncMock(return_value=True)
+    client.is_connected = True
+    client.degraded = False
     return client
 
 

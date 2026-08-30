@@ -22,6 +22,7 @@ class SubagentType(str, Enum):
 
     SANDBOX_RUNNER = "SANDBOX_RUNNER"
     ADR_DELTA_ANALYZER = "ADR_DELTA_ANALYZER"
+    GITHUB_PR = "GITHUB_PR"
 
 
 class SubagentStatus(str, Enum):
@@ -60,6 +61,8 @@ class ReviewSession(BaseModel):
     status: SessionStatus = SessionStatus.PENDING_SUBAGENTS
     diff_summary: str = ""
     raw_diff: str = ""
+    pr_number: int | None = None
+    repo: str | None = None
     tasks: list[SubagentTask] = Field(default_factory=list)
     pending_approval: PendingApproval | None = None
 

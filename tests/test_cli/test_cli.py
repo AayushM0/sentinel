@@ -121,3 +121,23 @@ async def test_cli_check_rejection_exits_1(temp_git_repo: Path) -> None:
             ]
         )
         assert exit_code == 1
+
+
+def test_parse_pr_flag() -> None:
+    """Test that --pr and --repo flags are parsed correctly."""
+    from sentinel.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["check", "--pr", "42", "--repo", "owner/repo"])
+    assert args.pr == 42
+    assert args.repo == "owner/repo"
+
+
+def test_parse_pr_flag_defaults() -> None:
+    """Test that --pr and --repo default to None."""
+    from sentinel.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["check"])
+    assert args.pr is None
+    assert args.repo is None
